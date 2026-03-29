@@ -1,0 +1,46 @@
+# Directories to ignore
+trainoutput/
+ckpt/
+data/
+results/
+visualization/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Distribution / packaging
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# pytest / coverage cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy / type checker cache
+.mypy_cache/
+.dmypy.json
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
