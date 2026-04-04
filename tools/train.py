@@ -189,11 +189,13 @@ def load_model_from_checkpoint(
 
     missing = [k for k in model_keys if k not in state_dict]
     if missing:
-        raise RuntimeError(f"Checkpoint missing keys: {missing[:20]}")
+        print(f"[load_checkpoint] WARNING: {len(missing)} keys not in checkpoint (will use random init): {missing[:20]}")
 
     mismatched = []
     filtered = {}
     for key in model_keys:
+        if key in missing:
+            continue
         tensor = model_state[key]
         ckpt_tensor = state_dict[key]
         if ckpt_tensor.shape != tensor.shape:
@@ -442,7 +444,7 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
 
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=cfg.get("amp", True) and device.type == "cuda"):
-                predictions = model(batch["images"], others={"extrinsics": normalized_extrinsics})
+                predictions = model(batch["images"], others={"extrinsics": normalized_extrinsics, "intrinsics": batch["intrinsics"]})
                 loss, metrics = compute_losses(
                     predictions,
                     batch,
@@ -489,7 +491,7 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
                 for batch in val_bar:
                     batch = {k: v.to(device) for k, v in batch.items()}
                     normalized_extrinsics = normalize_extrinsics_to_first_frame(batch["extrinsics"])
-                    predictions = model(batch["images"], others={"extrinsics": normalized_extrinsics})
+                    predictions = model(batch["images"], others={"extrinsics": normalized_extrinsics, "intrinsics": batch["intrinsics"]})
                     _, metrics = compute_losses(
                         predictions,
                         batch,

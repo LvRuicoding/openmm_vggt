@@ -12,13 +12,13 @@ Supplementary metrics:
     Abs Rel, Sq Rel, SILog, delta < 1.25, delta < 1.25^2, delta < 1.25^3
 
 Usage (single GPU)::
-    python tools/eval_kitti_depth_stereo.py configs/kitti_depth_stereo_ft.py \\
-        --checkpoint trainoutput/kitti_depth_stereo_ft/last.pth
+    python tools/eval_kitti_depth_stereo.py configs/kitti_depth_stereo_ft_scaled.py \\
+        --checkpoint trainoutput/kitti_depth_stereo_ft/epoch_002.pth
 
 Usage (multi-GPU)::
     torchrun --nproc_per_node=4 tools/eval_kitti_depth_stereo.py \\
-        configs/kitti_depth_stereo_ft.py \\
-        --checkpoint trainoutput/kitti_depth_stereo_ft/last.pth
+        configs/kitti_depth_stereo_ft_scaled.py \\
+        --checkpoint trainoutput/kitti_depth_stereo_ft/epoch_002.pth
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mmengine.config import Config
-from mmengine.registry import MODELS
+from mmengine.registry import DATASETS, MODELS
 
 import openmm_vggt  # noqa: F401
 from openmm_vggt.utils.geometry import closed_form_inverse_se3
@@ -94,26 +94,52 @@ def cleanup_distributed() -> None:
         dist.destroy_process_group()
 
 
+DEFAULT_EVAL_CHECKPOINT_NAME = "epoch_002.pth"
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint loader
 # ---------------------------------------------------------------------------
 
-def load_checkpoint(model: nn.Module, path: str) -> str:
+def matches_prefix(name: str, prefixes: Tuple[str, ...]) -> bool:
+    return any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes)
+
+
+def load_checkpoint(
+    model: nn.Module,
+    path: str,
+    include_prefixes: Optional[Tuple[str, ...]] = None,
+) -> str:
     ckpt = torch.load(path, map_location="cpu")
     state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     if all(k.startswith("module.") for k in state_dict):
         state_dict = {k[7:]: v for k, v in state_dict.items()}
+
     model_sd = model.state_dict()
+    model_keys = list(model_sd.keys())
+    if include_prefixes:
+        model_keys = [k for k in model_keys if matches_prefix(k, include_prefixes)]
+        if not model_keys:
+            raise RuntimeError(
+                f"No model keys matched include_prefixes={include_prefixes}"
+            )
+
     filtered, missing, shape_err = {}, [], []
-    for k, v in model_sd.items():
-        if k not in state_dict:
-            missing.append(k)
-        elif state_dict[k].shape != v.shape:
-            shape_err.append((k, tuple(v.shape), tuple(state_dict[k].shape)))
+    for key in model_keys:
+        value = model_sd[key]
+        if key not in state_dict:
+            missing.append(key)
+        elif state_dict[key].shape != value.shape:
+            shape_err.append((key, tuple(value.shape), tuple(state_dict[key].shape)))
         else:
-            filtered[k] = state_dict[k]
+            filtered[key] = state_dict[key]
     model.load_state_dict(filtered, strict=False)
-    parts = [f"loaded={len(filtered)}"]
+
+    extras = sorted(set(state_dict) - set(model_sd))
+    parts = [
+        f"loaded={len(filtered)}",
+        f"unexpected={len(extras)}",
+    ]
     if missing:
         parts.append(f"missing={len(missing)}")
     if shape_err:
@@ -432,8 +458,40 @@ class KITTIStereoValDataset(Dataset):
 # Collate
 # ---------------------------------------------------------------------------
 
-def collate_fn(batch):
-    return {k: torch.stack([b[k] for b in batch]) for k in batch[0]}
+def collate_batch(batch):
+    keys = [k for k in batch[0] if isinstance(batch[0][k], torch.Tensor)]
+    return {k: torch.stack([item[k] for item in batch], dim=0) for k in keys}
+
+
+def duplicate_singleton_batch(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Duplicate a singleton batch to avoid B=1 stride issues in model forward."""
+    if batch["images"].shape[0] != 1:
+        return batch
+    return {k: torch.cat([v, v], dim=0) for k, v in batch.items()}
+
+
+def resolve_checkpoint_path(args: argparse.Namespace, cfg: Config) -> str:
+    if args.checkpoint is not None:
+        return str(args.checkpoint)
+
+    cfg_eval_checkpoint = cfg.get("eval_checkpoint", None)
+    if cfg_eval_checkpoint is not None:
+        return str(cfg_eval_checkpoint)
+
+    output_dir = cfg.get("output_dir", None)
+    if output_dir is not None:
+        epoch_002_path = Path(output_dir) / DEFAULT_EVAL_CHECKPOINT_NAME
+        if epoch_002_path.is_file():
+            return str(epoch_002_path)
+
+    ckpt_path = cfg.get("checkpoint", None)
+    if ckpt_path is not None:
+        return str(ckpt_path)
+
+    raise ValueError(
+        "No checkpoint specified. Use --checkpoint, set eval_checkpoint in config, "
+        f"or ensure output_dir/{DEFAULT_EVAL_CHECKPOINT_NAME} exists."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -442,52 +500,47 @@ def collate_fn(batch):
 
 def evaluate(
     model: nn.Module,
-    dataset: Dataset,
+    data_loader: DataLoader,
     device: torch.device,
-    batch_size: int,
-    num_workers: int,
     depth_scale: float = 1.0,
 ) -> DepthMetrics:
     """Run inference and accumulate metrics. Last-frame image_02 is evaluated."""
-    # Distribute samples across GPUs manually
-    world = get_world_size()
-    rank  = get_rank()
-    indices = list(range(rank, len(dataset), world))
-    from torch.utils.data import Subset
-    sub = Subset(dataset, indices)
-
-    loader = DataLoader(
-        sub,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        collate_fn=collate_fn,
-        drop_last=False,
-    )
-
-    # Index of the last time-step's image_02 in the S=6 frame sequence
-    # Layout: [t0_02, t0_03, t1_02, t1_03, t2_02, t2_03]  ->  last cam02 = index 4
-    n_time_steps = dataset.dataset.n_time_steps if hasattr(dataset, "dataset") else dataset.n_time_steps
-    last_cam02_idx = (n_time_steps - 1) * 2  # 0-indexed: each timestep has 2 cams
-
     local = DepthMetrics()
-    bar = tqdm(loader, desc=f"Eval rank={rank}", leave=False, disable=not is_main())
+    bar = tqdm(
+        data_loader,
+        desc=f"Eval rank={get_rank()}",
+        leave=False,
+        disable=not is_main(),
+    )
 
     with torch.inference_mode():
         for batch in bar:
-            imgs = batch["images"].to(device, non_blocking=True)      # [B, 6, 3, H, W]
-            ext  = batch["extrinsics"].to(device, non_blocking=True)  # [B, 6, 3, 4]
-            deps = batch["depths"].to(device, non_blocking=True)      # [B, 6, H, W]
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            metric_batch = batch
+            model_batch = duplicate_singleton_batch(batch)
+
+            imgs = model_batch["images"]
+            ext = model_batch["extrinsics"]
+            deps = metric_batch["depths"]
 
             norm_ext = normalize_extrinsics_to_first_frame(ext)
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                preds = model(imgs, others={"extrinsics": norm_ext})
+                preds = model(
+                    imgs,
+                    others={
+                        "extrinsics": norm_ext,
+                        "intrinsics": model_batch["intrinsics"],
+                    },
+                )
 
-            # predicted depth: [B, S, H, W, 1] -> [B, H, W]
-            pred_depth = preds["depth"].squeeze(-1)          # [B, S, H, W]
-            pred_c = pred_depth[:, last_cam02_idx] * depth_scale  # [B, H, W]
-            gt_c   = deps[:, last_cam02_idx]                 # [B, H, W]
+            seq_len = imgs.shape[1]
+            if seq_len < 2:
+                raise RuntimeError(f"Expected stereo sequence, got seq_len={seq_len}")
+            last_cam02_idx = seq_len - 2
+
+            pred_depth = preds["depth"][: deps.shape[0]].squeeze(-1)
+            pred_c = pred_depth[:, last_cam02_idx] * depth_scale
+            gt_c = deps[:, last_cam02_idx]
 
             local.update(pred_c.float(), gt_c.float())
 
@@ -505,7 +558,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "config",
         nargs="?",
-        default=str(REPO_ROOT / "configs" / "kitti_depth_stereo_ft.py"),
+        default=str(REPO_ROOT / "configs" / "kitti_depth_stereo_ft_scaled.py"),
         help="mmengine config file.",
     )
     parser.add_argument("--checkpoint", type=str, default=None,
@@ -534,27 +587,40 @@ def main() -> None:
     try:
         cfg = Config.fromfile(args.config)
 
-        ckpt_path = args.checkpoint or getattr(cfg, "checkpoint", None)
-        if ckpt_path is None:
-            raise ValueError("No checkpoint specified (--checkpoint or config.checkpoint).")
-        ckpt_path = str(ckpt_path)
+        ckpt_path = resolve_checkpoint_path(args, cfg)
         if not Path(ckpt_path).is_file():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-        image_size = tuple(args.image_size) if args.image_size else tuple(cfg.image_size)
+        if cfg.get("val_dataset", None) is None:
+            raise ValueError("Config must define val_dataset for evaluation.")
+
+        if args.image_size is not None:
+            cfg.val_dataset.image_size = tuple(args.image_size)
+        if args.max_samples is not None:
+            cfg.val_dataset.max_samples = args.max_samples
+        if cfg.get("val_dataloader", None) is not None:
+            cfg.val_dataloader.batch_size = args.batch_size
+            cfg.val_dataloader.num_workers = args.num_workers
+
+        image_size = tuple(cfg.val_dataset.image_size)
         assert image_size[0] % 14 == 0 and image_size[1] % 14 == 0, (
             f"image_size {image_size} must be multiples of 14"
         )
 
-        n_time_steps = int(getattr(cfg, "n_time_steps", 3))
-        stride = int(getattr(cfg, "stride", 1))
+        n_time_steps = int(cfg.val_dataset.get("n_time_steps", getattr(cfg, "n_time_steps", 3)))
+        stride = int(cfg.val_dataset.get("stride", getattr(cfg, "stride", 1)))
 
         # Depth scale: CLI overrides config, config overrides default 1.0
         depth_scale = args.depth_scale if args.depth_scale is not None else float(cfg.get("depth_pred_scale", 1.0))
 
         # Build model
-        model = MODELS.build(dict(cfg.model))
-        msg = load_checkpoint(model, ckpt_path)
+        model = MODELS.build(cfg.model)
+        checkpoint_include_prefixes = tuple(cfg.get("checkpoint_include_prefixes", ()))
+        msg = load_checkpoint(
+            model,
+            ckpt_path,
+            include_prefixes=checkpoint_include_prefixes or None,
+        )
         model.to(device).eval()
 
         log("=" * 70)
@@ -566,27 +632,33 @@ def main() -> None:
         log(f"  n_time_steps: {n_time_steps}  stride={stride}")
         log(f"  world_size  : {get_world_size()}")
         log(f"  depth_scale : {depth_scale}")
+        log("  singleton batches: duplicated inside eval only")
         log("=" * 70)
 
-        # Build val dataset
-        dataset = KITTIStereoValDataset(
-            depth_root=cfg.depth_root,
-            raw_root=cfg.raw_root,
-            image_size=image_size,
-            n_time_steps=n_time_steps,
-            stride=stride,
-            split="val",
-            strict=False,
-            max_samples=args.max_samples,
+        dataset = DATASETS.build(cfg.val_dataset)
+        val_sampler = (
+            DistributedSampler(dataset, shuffle=False)
+            if get_world_size() > 1
+            else None
+        )
+        vdl_cfg = cfg.val_dataloader
+        val_loader = DataLoader(
+            dataset,
+            batch_size=vdl_cfg.batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=vdl_cfg.num_workers,
+            pin_memory=vdl_cfg.get("pin_memory", True),
+            collate_fn=collate_batch,
+            drop_last=False,
         )
         log(f"Val samples: {len(dataset)}")
+        log(f"Val batch_size: {vdl_cfg.batch_size}  num_workers={vdl_cfg.num_workers}")
 
         metrics = evaluate(
             model=model,
-            dataset=dataset,
+            data_loader=val_loader,
             device=device,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
             depth_scale=depth_scale,
         )
         res = metrics.result()

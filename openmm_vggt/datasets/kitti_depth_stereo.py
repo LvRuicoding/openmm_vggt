@@ -2,14 +2,20 @@
 """KITTI Depth Completion dataset with stereo + temporal context.
 
 Each sample consists of ``n_time_steps`` consecutive frames from a drive,
-loaded for BOTH image_02 and image_03.  The 6 images are interleaved as::
+loaded for BOTH image_02 and image_03.  The images are organized as::
 
-    [t-1_02, t-1_03, t0_02, t0_03, t+1_02, t+1_03]
+    Time step t-1: [image_02, image_03]
+    Time step t0:  [image_02, image_03]
+    Time step t+1: [image_02, image_03]
 
-so that the model receives S = n_time_steps * 2 images with cam_num = S
-(i.e. f_num = 1, one temporal step per "camera" group).  Only the centre
-frame (image_02) carries a ground-truth depth annotation; all other slots
-receive a depth map filled with -1.
+The model receives S = n_time_steps * 2 images with cam_num = 2 (stereo pair)
+and f_num = n_time_steps (temporal frames). The last time step's image_02 and
+image_03 both carry ground-truth depth annotations (where available); all other
+slots receive a depth map filled with -1.
+
+Data is returned in time-major order [t0_02, t0_03, t1_02, t1_03, ...].
+The model's forward() reshapes this as (B, f_num, cam_num, ...) and permutes
+to camera-major order internally before feeding the aggregator.
 """
 from __future__ import annotations
 
@@ -48,7 +54,8 @@ class _StereoDrive:
     # Per-camera image paths and GT depth paths
     image_paths_02: Dict[str, Path]
     image_paths_03: Dict[str, Path]
-    gt_paths_02: Dict[str, Path]       # GT only for image_02
+    gt_paths_02: Dict[str, Path]       # GT for image_02
+    gt_paths_03: Dict[str, Path]       # GT for image_03
     frame_ids: List[str]               # sorted intersection of valid frames
     extrinsics_02: Dict[str, np.ndarray]  # 3x4 cam02-world
     extrinsics_03: Dict[str, np.ndarray]  # 3x4 cam03-world
@@ -177,8 +184,7 @@ class KITTIDepthCompletionStereoDataset(Dataset):
                 gt_dir = drive_dir / "proj_depth" / "groundtruth" / cam
                 rgb_dir = raw_drive / cam / "data"
 
-                # GT depth is required only for image_02;
-                # image_03 GT may not exist — that is fine.
+                # GT depth is required for image_02; image_03 GT is used when available.
                 if cam == "image_02" and not gt_dir.is_dir():
                     ok = False
                     break
@@ -254,6 +260,7 @@ class KITTIDepthCompletionStereoDataset(Dataset):
                     image_paths_02=cam_data["image_02"]["image_paths"],
                     image_paths_03=cam_data["image_03"]["image_paths"],
                     gt_paths_02=cam_data["image_02"]["gt_paths"],
+                    gt_paths_03=cam_data["image_03"]["gt_paths"],
                     frame_ids=frame_ids,
                     extrinsics_02=cam_data["image_02"]["extrinsics"],
                     extrinsics_03=cam_data["image_03"]["extrinsics"],
@@ -334,9 +341,11 @@ class KITTIDepthCompletionStereoDataset(Dataset):
 
         orig_hw = drive.raw_hw  # (H, W) of raw image
 
+        # Build data in time-major order: [t0_02, t0_03, t1_02, t1_03, ...]
+        # The model's forward() expects time-major and reshapes as
+        # (B, f_num, cam_num, ...) before permuting to camera-major internally.
         for t_idx, fid in enumerate(time_frame_ids):
             is_last = (t_idx == self.n_time_steps - 1)  # only last time step has GT
-
             for cam_idx, cam in enumerate(("image_02", "image_03")):
                 if cam == "image_02":
                     img_path = drive.image_paths_02[fid]
@@ -347,74 +356,14 @@ class KITTIDepthCompletionStereoDataset(Dataset):
                     img_path = drive.image_paths_03[fid]
                     K_raw = drive.intrinsics_03
                     ext = drive.extrinsics_03[fid]
-                    gt_path = None  # GT only for image_02
+                    gt_path = drive.gt_paths_03.get(fid, None)
 
                 # RGB
                 image, _ = preprocess_rgb_like_demo(img_path, self.image_size)
                 images_list.append(image)
 
-                # Depth: GT only for the last time step's image_02
-                if is_last and cam == "image_02" and gt_path is not None:
-                    depth = preprocess_depth_png(gt_path, self.image_size)
-                else:
-                    depth = torch.full(
-                        self.image_size, -1.0, dtype=torch.float32
-                    )
-                depths_list.append(depth)
-
-                # Extrinsics (3x4)
-                extrinsics_list.append(
-                    torch.from_numpy(ext.copy())
-                )
-
-                # Intrinsics (3x3): resize from raw resolution
-                K = resize_intrinsics(
-                    K_raw, orig_hw=orig_hw, out_hw=self.image_size
-                )
-                intrinsics_list.append(torch.from_numpy(K))
-
-        # Stack: images  [S, 3, H, W]  with S = n_time_steps * 2
-        #        depths  [S, H, W]
-        #        extr    [S, 3, 4]
-        #        intr    [S, 3, 3]
-        return {
-            "images": torch.stack(images_list, dim=0),
-            "depths": torch.stack(depths_list, dim=0),
-            "extrinsics": torch.stack(extrinsics_list, dim=0),
-            "intrinsics": torch.stack(intrinsics_list, dim=0),
-            "sequence_name": (
-                f"{drive.name}_{time_frame_ids[0]}_{time_frame_ids[-1]}"
-            ),
-        }
-
-        images_list: List[torch.Tensor] = []
-        depths_list: List[torch.Tensor] = []
-        extrinsics_list: List[torch.Tensor] = []
-        intrinsics_list: List[torch.Tensor] = []
-
-        orig_hw = drive.raw_hw  # (H, W) of raw image
-
-        for t_idx, fid in enumerate(time_frame_ids):
-            is_last = (t_idx == self.n_time_steps - 1)  # only last time step has GT
-
-            for cam_idx, cam in enumerate(("image_02", "image_03")):
-                if cam == "image_02":
-                    img_path = drive.image_paths_02[fid]
-                    K_raw = drive.intrinsics_02
-                    ext = drive.extrinsics_02[fid]
-                    gt_path = drive.gt_paths_02.get(fid, None)
-                else:
-                    img_path = drive.image_paths_03[fid]
-                    K_raw = drive.intrinsics_03
-                    ext = drive.extrinsics_03[fid]
-                    gt_path = None  # GT only for image_02
-
-                # RGB
-                image, _ = preprocess_rgb_like_demo(img_path, self.image_size)
-                images_list.append(image)
-
-                # Depth: GT only for the last time step's image_02
-                if is_last and cam == "image_02" and gt_path is not None:
+                # Depth: GT for the last time step's image_02 and image_03 (if available)
+                if is_last and gt_path is not None:
                     depth = preprocess_depth_png(gt_path, self.image_size)
                 else:
                     depth = torch.full(

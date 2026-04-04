@@ -25,7 +25,7 @@ model = dict(
     enable_point=False,
     enable_depth=True,
     enable_track=False,
-    cam_num=6,
+    cam_num=2,  # Stereo pair: left (image_02) and right (image_03)
 )
 
 image_size   = (280, 518)
@@ -106,7 +106,7 @@ depth_pred_scale = 20.0
 checkpoint = '/home/dataset-local/lr/code/openmm_vggt/ckpt/checkpoint_5.pt'
 output_dir = '/home/dataset-local/lr/code/openmm_vggt/trainoutput/kitti_depth_stereo_ft_scaled'
 
-epochs       = 12
+epochs       = 24
 grad_clip    = 1.0
 amp          = True
 save_every   = 2
@@ -114,4 +114,4 @@ log_interval = 10
 seed         = 42
 
 freeze_modules            = ('aggregator', 'camera_head', 'camera_relative_head', 'mv_blocks', 'rel_pose_embed', 'batch_norm', 'layer_norm')
-freeze_modules_for_epochs = 30
+freeze_modules_for_epochs = 24
