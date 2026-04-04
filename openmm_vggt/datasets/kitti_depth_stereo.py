@@ -34,6 +34,7 @@ from .kitti_local_utils import (
     load_camera_transform_imu_to_rectified,
     load_oxts_poses,
     load_rectified_intrinsics,
+    load_transform_imu_to_velodyne,
     preprocess_depth_png,
     preprocess_rgb_like_demo,
     resize_intrinsics,
@@ -56,9 +57,11 @@ class _StereoDrive:
     image_paths_03: Dict[str, Path]
     gt_paths_02: Dict[str, Path]       # GT for image_02
     gt_paths_03: Dict[str, Path]       # GT for image_03
+    lidar_paths: Dict[str, Path]       # raw velodyne .bin per frame
     frame_ids: List[str]               # sorted intersection of valid frames
     extrinsics_02: Dict[str, np.ndarray]  # 3x4 cam02-world
     extrinsics_03: Dict[str, np.ndarray]  # 3x4 cam03-world
+    world_velodyne_poses: Dict[str, np.ndarray]  # 4x4 world<-velodyne per frame
     intrinsics_02: np.ndarray          # 3x3
     intrinsics_03: np.ndarray          # 3x3
 
@@ -111,6 +114,8 @@ class KITTIDepthCompletionStereoDataset(Dataset):
         strict: bool = False,
         max_sequences: Optional[int] = None,
         max_samples: Optional[int] = None,
+        return_lidar: bool = False,
+        max_lidar_points: int = 32768,
     ) -> None:
         assert n_time_steps >= 1, "n_time_steps must be >= 1"
         assert image_size[0] % 14 == 0 and image_size[1] % 14 == 0, (
@@ -126,6 +131,8 @@ class KITTIDepthCompletionStereoDataset(Dataset):
         self.strict = strict
         self.max_sequences = max_sequences
         self.max_samples = max_samples
+        self.return_lidar = return_lidar
+        self.max_lidar_points = max_lidar_points
 
         # Total model sequence length = n_time_steps stereo pairs
         self.seq_len = n_time_steps * 2  # cam_num for the model
@@ -180,6 +187,20 @@ class KITTIDepthCompletionStereoDataset(Dataset):
             # ---- camera-specific setup ----
             cam_data = {}
             ok = True
+            lidar_dir = raw_drive / "velodyne_points" / "data"
+            if self.return_lidar and not lidar_dir.is_dir():
+                if self.strict:
+                    raise FileNotFoundError(f"Missing raw lidar dir {lidar_dir}")
+                skipped += 1
+                continue
+            lidar_paths = {p.stem: p for p in sorted(lidar_dir.glob("*.bin"))} if lidar_dir.is_dir() else {}
+            try:
+                T_imu_velo = load_transform_imu_to_velodyne(calib_root)
+            except Exception:
+                if self.return_lidar and self.strict:
+                    raise
+                T_imu_velo = None
+
             for cam in ("image_02", "image_03"):
                 gt_dir = drive_dir / "proj_depth" / "groundtruth" / cam
                 rgb_dir = raw_drive / cam / "data"
@@ -243,6 +264,11 @@ class KITTIDepthCompletionStereoDataset(Dataset):
                 & set(cam_data["image_02"]["gt_paths"])
                 & set(oxts_poses)
             )
+            if self.return_lidar:
+                if T_imu_velo is None:
+                    skipped += 1
+                    continue
+                valid_ids = valid_ids & set(lidar_paths)
             frame_ids = sorted(valid_ids)
             span = (self.n_time_steps - 1) * self.stride + 1
             if len(frame_ids) < span:
@@ -251,6 +277,11 @@ class KITTIDepthCompletionStereoDataset(Dataset):
             # Peek image size
             first_path = cam_data["image_02"]["image_paths"][frame_ids[0]]
             raw_w, raw_h = Image.open(first_path).size
+
+            world_velodyne_poses: Dict[str, np.ndarray] = {}
+            if self.return_lidar:
+                for fid in frame_ids:
+                    world_velodyne_poses[fid] = (oxts_poses[fid] @ T_imu_velo).astype(np.float32)
 
             drives.append(
                 _StereoDrive(
@@ -261,9 +292,11 @@ class KITTIDepthCompletionStereoDataset(Dataset):
                     image_paths_03=cam_data["image_03"]["image_paths"],
                     gt_paths_02=cam_data["image_02"]["gt_paths"],
                     gt_paths_03=cam_data["image_03"]["gt_paths"],
+                    lidar_paths=lidar_paths,
                     frame_ids=frame_ids,
                     extrinsics_02=cam_data["image_02"]["extrinsics"],
                     extrinsics_03=cam_data["image_03"]["extrinsics"],
+                    world_velodyne_poses=world_velodyne_poses,
                     intrinsics_02=cam_data["image_02"]["K"],
                     intrinsics_03=cam_data["image_03"]["K"],
                 )
@@ -320,6 +353,28 @@ class KITTIDepthCompletionStereoDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _load_world_lidar_points(self, drive: _StereoDrive, frame_id: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        points = np.fromfile(drive.lidar_paths[frame_id], dtype=np.float32).reshape(-1, 4)
+        xyz1 = np.concatenate(
+            [points[:, :3], np.ones((points.shape[0], 1), dtype=np.float32)],
+            axis=1,
+        )
+        world_xyz = (drive.world_velodyne_poses[frame_id] @ xyz1.T).T[:, :3]
+        world_points = np.concatenate([world_xyz.astype(np.float32), points[:, 3:4]], axis=1)
+
+        if world_points.shape[0] > self.max_lidar_points:
+            indices = np.linspace(0, world_points.shape[0] - 1, self.max_lidar_points, dtype=np.int64)
+            world_points = world_points[indices]
+
+        point_tensor = torch.zeros((self.max_lidar_points, 4), dtype=torch.float32)
+        point_mask = torch.zeros((self.max_lidar_points,), dtype=torch.bool)
+        if world_points.shape[0] > 0:
+            valid = torch.from_numpy(world_points)
+            count = valid.shape[0]
+            point_tensor[:count] = valid
+            point_mask[:count] = True
+        return point_tensor, point_mask
+
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         drive_idx, last_idx = self.samples[index]
         drive = self.drives[drive_idx]
@@ -338,6 +393,9 @@ class KITTIDepthCompletionStereoDataset(Dataset):
         depths_list: List[torch.Tensor] = []
         extrinsics_list: List[torch.Tensor] = []
         intrinsics_list: List[torch.Tensor] = []
+        camera_to_world_list: List[torch.Tensor] = []
+        lidar_points_list: List[torch.Tensor] = []
+        lidar_mask_list: List[torch.Tensor] = []
 
         orig_hw = drive.raw_hw  # (H, W) of raw image
 
@@ -375,6 +433,9 @@ class KITTIDepthCompletionStereoDataset(Dataset):
                 extrinsics_list.append(
                     torch.from_numpy(ext.copy())
                 )
+                ext_h = np.eye(4, dtype=np.float32)
+                ext_h[:3, :] = ext
+                camera_to_world_list.append(torch.from_numpy(np.linalg.inv(ext_h).astype(np.float32)))
 
                 # Intrinsics (3x3): resize from raw resolution
                 K = resize_intrinsics(
@@ -382,11 +443,16 @@ class KITTIDepthCompletionStereoDataset(Dataset):
                 )
                 intrinsics_list.append(torch.from_numpy(K))
 
+            if self.return_lidar:
+                lidar_points, lidar_mask = self._load_world_lidar_points(drive, fid)
+                lidar_points_list.append(lidar_points)
+                lidar_mask_list.append(lidar_mask)
+
         # Stack: images  [S, 3, H, W]  with S = n_time_steps * 2
         #        depths  [S, H, W]
         #        extr    [S, 3, 4]
         #        intr    [S, 3, 3]
-        return {
+        output = {
             "images": torch.stack(images_list, dim=0),
             "depths": torch.stack(depths_list, dim=0),
             "extrinsics": torch.stack(extrinsics_list, dim=0),
@@ -395,4 +461,9 @@ class KITTIDepthCompletionStereoDataset(Dataset):
                 f"{drive.name}_{time_frame_ids[0]}_{time_frame_ids[-1]}"
             ),
         }
+        if self.return_lidar:
+            output["camera_to_world"] = torch.stack(camera_to_world_list, dim=0)
+            output["points"] = torch.stack(lidar_points_list, dim=0)
+            output["point_mask"] = torch.stack(lidar_mask_list, dim=0)
+        return output
         

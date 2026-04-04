@@ -113,6 +113,17 @@ def collate_batch(batch):
     return {k: torch.stack([item[k] for item in batch], dim=0) for k in keys}
 
 
+def build_model_others(batch: Dict[str, torch.Tensor], normalized_extrinsics: torch.Tensor) -> Dict[str, torch.Tensor]:
+    others = {
+        "extrinsics": normalized_extrinsics,
+        "intrinsics": batch["intrinsics"],
+    }
+    for key in ("camera_to_world", "points", "point_mask"):
+        if key in batch:
+            others[key] = batch[key]
+    return others
+
+
 def matches_prefix(name: str, prefixes: Iterable[str]) -> bool:
     return any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes)
 
@@ -444,7 +455,7 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
 
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=cfg.get("amp", True) and device.type == "cuda"):
-                predictions = model(batch["images"], others={"extrinsics": normalized_extrinsics, "intrinsics": batch["intrinsics"]})
+                predictions = model(batch["images"], others=build_model_others(batch, normalized_extrinsics))
                 loss, metrics = compute_losses(
                     predictions,
                     batch,
@@ -491,7 +502,7 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
                 for batch in val_bar:
                     batch = {k: v.to(device) for k, v in batch.items()}
                     normalized_extrinsics = normalize_extrinsics_to_first_frame(batch["extrinsics"])
-                    predictions = model(batch["images"], others={"extrinsics": normalized_extrinsics, "intrinsics": batch["intrinsics"]})
+                    predictions = model(batch["images"], others=build_model_others(batch, normalized_extrinsics))
                     _, metrics = compute_losses(
                         predictions,
                         batch,

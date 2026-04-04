@@ -107,6 +107,11 @@ def load_camera_transform_imu_to_rectified(camera_root: Path, camera: str) -> np
     return t_rect_imu.astype(np.float64)
 
 
+def load_transform_imu_to_velodyne(camera_root: Path) -> np.ndarray:
+    imu_calib = parse_calib_file(camera_root / "calib_imu_to_velo.txt")
+    return build_se3(imu_calib["R"], imu_calib["T"]).astype(np.float64)
+
+
 def resize_intrinsics(intrinsics: np.ndarray, orig_hw: Tuple[int, int], out_hw: Tuple[int, int]) -> np.ndarray:
     orig_h, orig_w = orig_hw
     out_h, out_w = out_hw
