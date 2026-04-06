@@ -3,7 +3,7 @@
 
 Input: 3 time-steps x 2 cameras = 6 frames, causal sliding window with
 scheme-A padding (earliest frame repeated when history is insufficient).
-Only the last time-step image_02 carries GT depth and is evaluated.
+Only the last time-step stereo pair is evaluated.
 
 Official KITTI depth prediction metrics (main table):
     iRMSE  [1/km], iMAE [1/km], RMSE [mm], MAE [mm]
@@ -33,7 +33,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -463,6 +463,23 @@ def collate_batch(batch):
     return {k: torch.stack([item[k] for item in batch], dim=0) for k in keys}
 
 
+class DistributedEvalSampler(Sampler[int]):
+    """Shard eval data across ranks without padding or duplicated samples."""
+
+    def __init__(self, dataset) -> None:
+        if not is_dist():
+            raise RuntimeError("DistributedEvalSampler requires initialized distributed mode.")
+        self.dataset = dataset
+        self.rank = get_rank()
+        self.world_size = dist.get_world_size()
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self) -> int:
+        return len(range(self.rank, len(self.dataset), self.world_size))
+
+
 def duplicate_singleton_batch(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """Duplicate a singleton batch to avoid B=1 stride issues in model forward."""
     if batch["images"].shape[0] != 1:
@@ -504,7 +521,7 @@ def evaluate(
     device: torch.device,
     depth_scale: float = 1.0,
 ) -> DepthMetrics:
-    """Run inference and accumulate metrics. Last-frame image_02 is evaluated."""
+    """Run inference and accumulate metrics on the last-frame stereo pair."""
     local = DepthMetrics()
     bar = tqdm(
         data_loader,
@@ -536,11 +553,11 @@ def evaluate(
             seq_len = imgs.shape[1]
             if seq_len < 2:
                 raise RuntimeError(f"Expected stereo sequence, got seq_len={seq_len}")
-            last_cam02_idx = seq_len - 2
+            last_pair_start = seq_len - 2
 
             pred_depth = preds["depth"][: deps.shape[0]].squeeze(-1)
-            pred_c = pred_depth[:, last_cam02_idx] * depth_scale
-            gt_c = deps[:, last_cam02_idx]
+            pred_c = pred_depth[:, last_pair_start:] * depth_scale
+            gt_c = deps[:, last_pair_start:]
 
             local.update(pred_c.float(), gt_c.float())
 
@@ -637,7 +654,7 @@ def main() -> None:
 
         dataset = DATASETS.build(cfg.val_dataset)
         val_sampler = (
-            DistributedSampler(dataset, shuffle=False)
+            DistributedEvalSampler(dataset)
             if get_world_size() > 1
             else None
         )

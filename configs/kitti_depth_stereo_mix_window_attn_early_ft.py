@@ -1,13 +1,13 @@
 # mmengine-style Python config for KITTI depth completion fine-tuning
-# Variant model: mix_decoder_global_early
-# Applies patch/voxel fusion immediately after patch embedding,
+# Variant model: mix_decoder_global_window_attn_early
+# Applies regular + shifted-window patch/voxel attention immediately after patch embedding,
 # before the VGGT backbone attention stack.
 
 depth_root = '/home/dataset-local/lr/code/openmm_vggt/data/OpenDataLab___KITTI_depth_completion'
 raw_root   = '/home/dataset-local/lr/code/openmm_vggt/data/kitti_raw'
 
 model = dict(
-    type='mix_decoder_global_early',
+    type='mix_decoder_global_window_attn_early',
     img_size=518,
     patch_size=14,
     embed_dim=1024,
@@ -19,6 +19,11 @@ model = dict(
     voxel_size=(0.4, 0.4, 0.8),
     point_cloud_range=(0.0, -40.0, -3.0, 80.0, 40.0, 3.0),
     serializer_grid_size_2d=14.0,
+    fusion_window_size=(10, 10),
+    fusion_shift_size=(5, 5),
+    fusion_num_heads=16,
+    fusion_mlp_ratio=4.0,
+    fusion_attn_backend='sdpa',
 )
 
 image_size = (280, 518)
@@ -83,7 +88,7 @@ pose_fov_weight = 0.0
 depth_pred_scale = 20.0
 
 checkpoint = '/home/dataset-local/lr/code/openmm_vggt/ckpt/checkpoint_5.pt'
-output_dir = '/home/dataset-local/lr/code/openmm_vggt/trainoutput/kitti_depth_stereo_mix_early_ft'
+output_dir = '/home/dataset-local/lr/code/openmm_vggt/trainoutput/kitti_depth_stereo_mix_window_attn_early_ft'
 
 epochs = 24
 grad_clip = 1.0

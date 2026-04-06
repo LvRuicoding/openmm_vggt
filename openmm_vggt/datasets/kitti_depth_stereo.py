@@ -394,6 +394,7 @@ class KITTIDepthCompletionStereoDataset(Dataset):
         extrinsics_list: List[torch.Tensor] = []
         intrinsics_list: List[torch.Tensor] = []
         camera_to_world_list: List[torch.Tensor] = []
+        lidar_to_world_list: List[torch.Tensor] = []
         lidar_points_list: List[torch.Tensor] = []
         lidar_mask_list: List[torch.Tensor] = []
 
@@ -445,6 +446,9 @@ class KITTIDepthCompletionStereoDataset(Dataset):
 
             if self.return_lidar:
                 lidar_points, lidar_mask = self._load_world_lidar_points(drive, fid)
+                lidar_to_world_list.append(
+                    torch.from_numpy(drive.world_velodyne_poses[fid].astype(np.float32))
+                )
                 lidar_points_list.append(lidar_points)
                 lidar_mask_list.append(lidar_mask)
 
@@ -463,6 +467,7 @@ class KITTIDepthCompletionStereoDataset(Dataset):
         }
         if self.return_lidar:
             output["camera_to_world"] = torch.stack(camera_to_world_list, dim=0)
+            output["lidar_to_world"] = torch.stack(lidar_to_world_list, dim=0)
             output["points"] = torch.stack(lidar_points_list, dim=0)
             output["point_mask"] = torch.stack(lidar_mask_list, dim=0)
         return output

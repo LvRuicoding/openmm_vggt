@@ -1,8 +1,8 @@
-# mmengine-style Python config for KITTI depth completion fine-tuning
-# Variant: pred_depth * depth_pred_scale before loss computation.
+# mmengine-style Python config for KITTI depth completion fine-tuning.
+# This is the retained KITTI depth stereo baseline config.
+# pred_depth is scaled by depth_pred_scale before loss computation.
 # depth_pred_scale=20 compensates for the original model's output range
 # (~0.8m mean) vs KITTI's typical depth range (~15-20m mean).
-# Compare against kitti_depth_stereo_ft.py (no scaling) to decide which converges better.
 #
 # Run (4 GPUs):
 #   torchrun --nproc_per_node=4 tools/train.py configs/kitti_depth_stereo_ft_scaled.py --no-eval
@@ -97,7 +97,6 @@ pose_fov_weight         = 0.0
 # pred_depth_for_loss = pred_depth * depth_pred_scale
 # This compensates for the original model outputting ~0.8m mean
 # while KITTI GT has ~15-20m mean.
-# Set to 1.0 in kitti_depth_stereo_ft.py (no scaling).
 depth_pred_scale = 20.0
 
 # ---------------------------------------------------------------------------

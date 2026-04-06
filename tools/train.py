@@ -118,7 +118,7 @@ def build_model_others(batch: Dict[str, torch.Tensor], normalized_extrinsics: to
         "extrinsics": normalized_extrinsics,
         "intrinsics": batch["intrinsics"],
     }
-    for key in ("camera_to_world", "points", "point_mask"):
+    for key in ("camera_to_world", "lidar_to_world", "points", "point_mask"):
         if key in batch:
             others[key] = batch[key]
     return others

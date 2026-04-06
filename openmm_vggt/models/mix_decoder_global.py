@@ -166,18 +166,52 @@ class mix_decoder_global(nn.Module, PyTorchModelHubMixin):
         )
         return patch_y, patch_x, visible
 
-    def _encode_voxels(self, points: torch.Tensor, point_mask: torch.Tensor):
+    def _world_points_to_local(self, points: torch.Tensor, point_mask: torch.Tensor, lidar_to_world: torch.Tensor):
+        valid_indices = torch.nonzero(point_mask, as_tuple=False)
+        if valid_indices.shape[0] == 0:
+            return points.new_zeros((0, 5))
+
+        batch_ids = valid_indices[:, 0]
+        selected_points = points[batch_ids, valid_indices[:, 1]]
+        xyz1 = torch.cat([selected_points[:, :3], torch.ones_like(selected_points[:, :1])], dim=-1)
+        world_to_lidar = torch.inverse(lidar_to_world[batch_ids])
+        local_xyz = torch.matmul(world_to_lidar, xyz1.unsqueeze(-1)).squeeze(-1)[..., :3]
+
+        local_points = selected_points.clone()
+        local_points[:, :3] = local_xyz
+        return torch.cat([batch_ids.to(points.dtype).unsqueeze(-1), local_points], dim=-1)
+
+    def _local_voxel_centers_to_world(
+        self,
+        voxel_centers: torch.Tensor,
+        voxel_batch_ids: torch.Tensor,
+        lidar_to_world: torch.Tensor,
+    ) -> torch.Tensor:
+        if voxel_centers.shape[0] == 0:
+            return voxel_centers
+
+        xyz1 = torch.cat([voxel_centers, torch.ones_like(voxel_centers[..., :1])], dim=-1)
+        return torch.matmul(lidar_to_world[voxel_batch_ids], xyz1.unsqueeze(-1)).squeeze(-1)[..., :3]
+
+    def _encode_voxels(
+        self,
+        points: torch.Tensor,
+        point_mask: torch.Tensor,
+        lidar_to_world: torch.Tensor | None = None,
+    ):
         device = points.device
-        batch_frames, _, _ = points.shape
         valid_indices = torch.nonzero(point_mask, as_tuple=False)
         if valid_indices.shape[0] == 0:
             empty_feat = points.new_zeros((0, self.voxel_feature_proj.in_features))
             empty_coord = torch.zeros((0, 4), dtype=torch.long, device=device)
             return empty_feat, empty_coord
 
-        batch_ids = valid_indices[:, 0].to(points.dtype).unsqueeze(-1)
-        selected_points = points[valid_indices[:, 0], valid_indices[:, 1]]
-        flat_points = torch.cat([batch_ids, selected_points], dim=-1)
+        if lidar_to_world is not None:
+            flat_points = self._world_points_to_local(points, point_mask, lidar_to_world)
+        else:
+            batch_ids = valid_indices[:, 0].to(points.dtype).unsqueeze(-1)
+            selected_points = points[valid_indices[:, 0], valid_indices[:, 1]]
+            flat_points = torch.cat([batch_ids, selected_points], dim=-1)
         voxel_features, voxel_coords = self.voxel_encoder(flat_points)
         return voxel_features, voxel_coords
 
@@ -193,8 +227,11 @@ class mix_decoder_global(nn.Module, PyTorchModelHubMixin):
         point_mask = others["point_mask"].reshape(batch_size * frame_count, others["point_mask"].shape[2])
         intrinsics = others["intrinsics"].reshape(batch_size, frame_count, self.cam_num, 3, 3).reshape(batch_size * frame_count, self.cam_num, 3, 3)
         camera_to_world = others["camera_to_world"].reshape(batch_size, frame_count, self.cam_num, 4, 4).reshape(batch_size * frame_count, self.cam_num, 4, 4)
+        lidar_to_world = None
+        if "lidar_to_world" in others:
+            lidar_to_world = others["lidar_to_world"].reshape(batch_size * frame_count, 4, 4)
 
-        voxel_features, voxel_coords = self._encode_voxels(points, point_mask)
+        voxel_features, voxel_coords = self._encode_voxels(points, point_mask, lidar_to_world=lidar_to_world)
         voxel_tokens = self.voxel_feature_proj(voxel_features)
         voxel_centers = self._voxel_coords_to_centers(voxel_coords)
         patch_h = image_hw[0] // self.patch_size
@@ -205,6 +242,8 @@ class mix_decoder_global(nn.Module, PyTorchModelHubMixin):
             return voxel_tokens.new_zeros((batch_size * frame_count, self.cam_num, patch_count, channels))
 
         voxel_batch_ids = voxel_coords[:, 0].long()
+        if lidar_to_world is not None:
+            voxel_centers = self._local_voxel_centers_to_world(voxel_centers, voxel_batch_ids, lidar_to_world)
         patch_y, patch_x, visible = self._project_voxels_to_patches(
             voxel_centers,
             voxel_batch_ids,
