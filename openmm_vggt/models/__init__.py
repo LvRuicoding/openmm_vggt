@@ -9,7 +9,6 @@ from .vggt_decoder_vkitti import VGGT_decoder_vkitti, VGGT_fastdecoder as VGGT_f
 from .mix_decoder_global import mix_decoder_global
 from .mix_decoder_global_early import mix_decoder_global_early
 from .mix_decoder_global_serializer2d_early import mix_decoder_global_serializer2d_early
-from .mix_decoder_global_window_attn import mix_decoder_global_window_attn
 from .mix_decoder_global_window_attn_early import mix_decoder_global_window_attn_early
 
 __all__ = [
@@ -29,6 +28,5 @@ __all__ = [
     "mix_decoder_global",
     "mix_decoder_global_early",
     "mix_decoder_global_serializer2d_early",
-    "mix_decoder_global_window_attn",
     "mix_decoder_global_window_attn_early",
 ]
