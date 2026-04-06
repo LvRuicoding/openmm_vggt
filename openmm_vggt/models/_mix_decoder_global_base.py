@@ -106,10 +106,9 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
             use_absolute_xyz=True,
             num_filters=voxel_encoder_filters,
         )
-        self.voxel_feature_proj = nn.Linear(self.voxel_encoder.get_output_feature_dim(), embed_dim * 2)
+        self.voxel_encoder_out_dim = self.voxel_encoder.get_output_feature_dim()
         self.register_buffer("fusion_voxel_size", torch.tensor(voxel_size, dtype=torch.float32), persistent=False)
         self.register_buffer("fusion_point_cloud_range", torch.tensor(point_cloud_range, dtype=torch.float32), persistent=False)
-        self.patch_fusions = nn.ModuleList([SimplePatchFusion(embed_dim * 2) for _ in self.selected_list])
 
     def camera_tokens_agg(self, camera_tokens, token_type):
         if camera_tokens.dim() == 2:
@@ -180,74 +179,6 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
         u = img_coords[..., 0] / safe_depth
         v = img_coords[..., 1] / safe_depth
         return u, v, depth
-
-    def _z_buffer_patch_features(
-        self,
-        voxel_tokens: torch.Tensor,
-        voxel_batch_ids: torch.Tensor,
-        patch_y: torch.Tensor,
-        patch_x: torch.Tensor,
-        visible: torch.Tensor,
-        depth: torch.Tensor,
-        batch_size: int,
-        frame_count: int,
-        patch_w: int,
-        patch_count: int,
-    ) -> torch.Tensor:
-        channels = voxel_tokens.shape[-1]
-        flat_output_size = batch_size * frame_count * self.cam_num * patch_count
-        flat_patch_voxel_features = voxel_tokens.new_zeros((flat_output_size, channels))
-        if voxel_tokens.shape[0] == 0:
-            return flat_patch_voxel_features
-
-        cam_ids = torch.arange(
-            self.cam_num, device=voxel_tokens.device, dtype=torch.long
-        ).unsqueeze(0).expand_as(patch_y)
-        flat_visible = visible.reshape(-1)
-        if not torch.any(flat_visible):
-            return flat_patch_voxel_features
-
-        flat_patch_index = (patch_y * patch_w + patch_x).reshape(-1)
-        flat_voxel_batch_ids = voxel_batch_ids.unsqueeze(1).expand(-1, self.cam_num).reshape(-1)
-        flat_cam_ids = cam_ids.reshape(-1)
-        flat_output_index = (
-            ((flat_voxel_batch_ids * self.cam_num + flat_cam_ids) * patch_count) + flat_patch_index
-        )
-
-        valid_output_index = flat_output_index[flat_visible]
-        valid_features = voxel_tokens.unsqueeze(1).expand(-1, self.cam_num, -1).reshape(-1, channels)[flat_visible]
-        valid_depth = depth.reshape(-1)[flat_visible]
-
-        min_depth = torch.full(
-            (flat_output_size,),
-            torch.finfo(valid_depth.dtype).max,
-            device=valid_depth.device,
-            dtype=valid_depth.dtype,
-        )
-        min_depth.scatter_reduce_(0, valid_output_index, valid_depth, reduce="amin", include_self=True)
-
-        nearest_mask = valid_depth <= (min_depth[valid_output_index] + 1e-6)
-        nearest_positions = torch.nonzero(nearest_mask, as_tuple=False).squeeze(-1)
-        nearest_output_index = valid_output_index[nearest_positions]
-
-        first_position = torch.full(
-            (flat_output_size,),
-            nearest_positions.shape[0],
-            device=valid_output_index.device,
-            dtype=torch.long,
-        )
-        first_position.scatter_reduce_(
-            0,
-            nearest_output_index,
-            nearest_positions,
-            reduce="amin",
-            include_self=True,
-        )
-
-        selected_mask = first_position < nearest_positions.shape[0]
-        if torch.any(selected_mask):
-            flat_patch_voxel_features[selected_mask] = valid_features[first_position[selected_mask]]
-        return flat_patch_voxel_features
 
     def _select_all_projected_voxels(
         self,
@@ -362,7 +293,7 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
         device = points.device
         valid_indices = torch.nonzero(point_mask, as_tuple=False)
         if valid_indices.shape[0] == 0:
-            empty_feat = points.new_zeros((0, self.voxel_feature_proj.in_features))
+            empty_feat = points.new_zeros((0, self.voxel_encoder_out_dim))
             empty_coord = torch.zeros((0, 4), dtype=torch.long, device=device)
             return empty_feat, empty_coord
 
@@ -381,64 +312,6 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
             self.fusion_point_cloud_range[:3]
             + (xyz_index + 0.5) * self.fusion_voxel_size
         )
-
-    def _prepare_patch_voxel_features(self, others: dict, batch_size: int, frame_count: int, image_hw):
-        points = others["points"].reshape(batch_size * frame_count, others["points"].shape[2], others["points"].shape[3])
-        point_mask = others["point_mask"].reshape(batch_size * frame_count, others["point_mask"].shape[2])
-        intrinsics = others["intrinsics"].reshape(batch_size, frame_count, self.cam_num, 3, 3).reshape(batch_size * frame_count, self.cam_num, 3, 3)
-        camera_to_world = others["camera_to_world"].reshape(batch_size, frame_count, self.cam_num, 4, 4).reshape(batch_size * frame_count, self.cam_num, 4, 4)
-        lidar_to_world = None
-        if "lidar_to_world" in others:
-            lidar_to_world = others["lidar_to_world"].reshape(batch_size * frame_count, 4, 4)
-
-        voxel_features, voxel_coords = self._encode_voxels(points, point_mask, lidar_to_world=lidar_to_world)
-        voxel_tokens = self.voxel_feature_proj(voxel_features)
-        voxel_centers = self._voxel_coords_to_centers(voxel_coords)
-        patch_h = image_hw[0] // self.patch_size
-        patch_w = image_hw[1] // self.patch_size
-        patch_count = patch_h * patch_w
-        channels = voxel_tokens.shape[-1]
-        if voxel_tokens.shape[0] == 0:
-            return voxel_tokens.new_zeros((batch_size * frame_count, self.cam_num, patch_count, channels))
-
-        flat_seq_count = batch_size * frame_count * self.cam_num
-        voxel_batch_ids = voxel_coords[:, 0].long()
-        if lidar_to_world is not None:
-            voxel_centers = self._local_voxel_centers_to_world(voxel_centers, voxel_batch_ids, lidar_to_world)
-        patch_y, patch_x, visible, depth = self._project_voxels_to_patches(
-            voxel_centers,
-            voxel_batch_ids,
-            intrinsics,
-            camera_to_world,
-            patch_h,
-            patch_w,
-        )
-        projection_selection = self._select_projected_voxels(
-            voxel_batch_ids=voxel_batch_ids,
-            patch_y=patch_y,
-            patch_x=patch_x,
-            visible=visible,
-            depth=depth,
-            batch_size=batch_size,
-            frame_count=frame_count,
-            patch_w=patch_w,
-            patch_count=patch_count,
-        )
-        selected_valid_positions = projection_selection["selected_valid_positions"]
-        if selected_valid_positions.numel() == 0:
-            return voxel_tokens.new_zeros((batch_size * frame_count, self.cam_num, patch_count, channels))
-
-        flat_voxel_tokens = voxel_tokens.unsqueeze(1).expand(-1, self.cam_num, -1).reshape(-1, channels)
-        valid_voxel_tokens = flat_voxel_tokens[visible.reshape(-1)]
-        selected_voxel_tokens = valid_voxel_tokens[selected_valid_positions]
-        dense_patch_voxel_tokens = self._scatter_projected_tokens_to_dense_grid(
-            projected_tokens=selected_voxel_tokens,
-            flat_seq_ids=projection_selection["flat_seq_ids"],
-            patch_idx=projection_selection["patch_idx"],
-            flat_seq_count=flat_seq_count,
-            patch_count=patch_count,
-        )
-        return dense_patch_voxel_tokens.reshape(batch_size * frame_count, self.cam_num, patch_count, channels)
 
     def _enable_early_patch_fusion(self) -> bool:
         return False
@@ -759,16 +632,6 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
         fusion_inputs = self._prepare_common_early_fusion_inputs(others, batch_size, frame_count, image_hw)
         return self._apply_early_patch_fusion(patch_tokens, fusion_inputs, image_hw)
 
-    def _mix_patch_tokens(self, patch_tokens: torch.Tensor, patch_voxel_features: torch.Tensor, layer_idx: int):
-        batch_size, sequence_length, patch_count, channels = patch_tokens.shape
-        frame_count = sequence_length // self.cam_num
-        patch_tokens = patch_tokens.reshape(batch_size, frame_count, self.cam_num, patch_count, channels)
-        flat_patch_tokens = patch_tokens.reshape(batch_size * frame_count, self.cam_num * patch_count, channels)
-        flat_patch_voxel_features = patch_voxel_features.reshape(batch_size * frame_count, self.cam_num * patch_count, channels)
-        fused_tokens = self.patch_fusions[layer_idx](flat_patch_tokens, flat_patch_voxel_features)
-        fused_tokens = fused_tokens.reshape(batch_size, frame_count, self.cam_num, patch_count, channels)
-        return fused_tokens.reshape(batch_size, sequence_length, patch_count, channels)
-
     def _forward_from_aggregator_outputs(
         self,
         aggregated_tokens_list,
@@ -815,7 +678,6 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
 
         last_pose_enc = aggregated_tokens_list[-1][..., 0, :]
         selected_layers = [aggregated_tokens_list[i] for i in self.selected_list]
-        patch_voxel_features = self._prepare_patch_voxel_features(others, batch_size, frame_count, (image_h, image_w))
 
         agg_layers_depths_tokens_list: List[torch.Tensor] = []
         agg_layers_camera_frame_tokens_list: List[torch.Tensor] = []
@@ -829,9 +691,6 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
             _, _, token_count, channels = aggregated_tokens.size()
             frame_tokens = aggregated_tokens.view(batch_size, -1, token_count, channels)
             frame_depth_tokens = frame_tokens[:, :, patch_start_idx:, :]
-            frame_depth_tokens = self._camera_major_to_time_major(frame_depth_tokens, batch_size, frame_count)
-            frame_depth_tokens = self._mix_patch_tokens(frame_depth_tokens, patch_voxel_features, layer_idx)
-            frame_depth_tokens = self._time_major_to_camera_major(frame_depth_tokens, batch_size, frame_count)
 
             frame_pose_tokens = frame_tokens[:, :, 0, :].unsqueeze(2)
             frame_relative_tokens = relative_pose_enc.unsqueeze(2).expand(batch_size, self.cam_num, frame_count, channels).reshape(batch_size, -1, 1, channels)

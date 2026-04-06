@@ -3,7 +3,7 @@ trainoutput/
 ckpt/
 data/
 results/
-visualization/
+visualizations/
 
 # Python cache
 __pycache__/
