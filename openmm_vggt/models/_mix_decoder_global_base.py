@@ -3,7 +3,6 @@ from typing import List
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
-from mmengine.registry import MODELS
 from torch.utils.checkpoint import checkpoint
 
 from .aggregator import Aggregator
@@ -37,8 +36,7 @@ class SimplePatchFusion(nn.Module):
         return patch_tokens + gate * voxel_features
 
 
-@MODELS.register_module()
-class mix_decoder_global(nn.Module, PyTorchModelHubMixin):
+class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
     def __init__(
         self,
         img_size=518,

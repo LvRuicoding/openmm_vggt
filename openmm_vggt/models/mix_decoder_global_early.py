@@ -7,11 +7,11 @@ from mmengine.registry import MODELS
 from openmm_vggt.utils.pose_enc import extri_to_pose_encoding, pose_encoding_to_extri_intri
 
 from .aggregator_window_attn_early import EarlyFusionAggregator
-from .mix_decoder_global import SimplePatchFusion, mix_decoder_global
+from ._mix_decoder_global_base import SimplePatchFusion, _MixDecoderGlobalBase
 
 
 @MODELS.register_module()
-class mix_decoder_global_early(mix_decoder_global):
+class mix_decoder_global_early(_MixDecoderGlobalBase):
     def __init__(
         self,
         img_size=518,

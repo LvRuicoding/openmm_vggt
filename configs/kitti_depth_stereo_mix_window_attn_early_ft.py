@@ -90,7 +90,7 @@ depth_pred_scale = 20.0
 checkpoint = '/home/dataset-local/lr/code/openmm_vggt/ckpt/checkpoint_5.pt'
 output_dir = '/home/dataset-local/lr/code/openmm_vggt/trainoutput/kitti_depth_stereo_mix_window_attn_early_ft'
 
-epochs = 24
+epochs = 4
 grad_clip = 1.0
 amp = True
 save_every = 2
@@ -98,4 +98,4 @@ log_interval = 10
 seed = 42
 
 freeze_modules = ('aggregator', 'camera_head', 'camera_relative_head', 'mv_blocks', 'rel_pose_embed', 'batch_norm', 'layer_norm', 'voxel_encoder')
-freeze_modules_for_epochs = 24
+freeze_modules_for_epochs = 4
