@@ -51,6 +51,7 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
         point_cloud_range=(0.0, -40.0, -3.0, 80.0, 40.0, 3.0),
         voxel_encoder_filters=(128, 128),
         serializer_grid_size_2d=14.0,
+        use_z_buffer_projection=True,
     ):
         super().__init__()
         self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
@@ -62,6 +63,7 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
 
         self.cam_num = cam_num
         self.patch_size = patch_size
+        self.use_z_buffer_projection = bool(use_z_buffer_projection)
         self.rel_pose_embed = nn.Linear(7, 2048)
         self.intri_embed = nn.Linear(4, 2048)
         self.pose_intri_fuse = nn.Linear(4096, 2048)
@@ -145,14 +147,12 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
         return tensor.reshape(batch_size, frame_count * self.cam_num, *shape[2:])
 
     def _project_voxels_to_patches(self, voxel_coords, voxel_batch_ids, intrinsics, camera_to_world, patch_h, patch_w):
-        xyz1 = torch.cat([voxel_coords, torch.ones_like(voxel_coords[..., :1])], dim=-1)
-        world_to_camera = torch.inverse(camera_to_world)[voxel_batch_ids]
-        cam_coords = torch.matmul(world_to_camera, xyz1[:, None, :, None]).squeeze(-1)[..., :3]
-        img_coords = torch.matmul(intrinsics[voxel_batch_ids], cam_coords.unsqueeze(-1)).squeeze(-1)
-        depth = img_coords[..., 2]
-        safe_depth = torch.clamp(depth, min=1e-5)
-        u = img_coords[..., 0] / safe_depth
-        v = img_coords[..., 1] / safe_depth
+        u, v, depth = self._project_voxels_to_image_coords(
+            voxel_coords,
+            voxel_batch_ids,
+            intrinsics,
+            camera_to_world,
+        )
         patch_x = torch.floor(u / self.patch_size).to(torch.long)
         patch_y = torch.floor(v / self.patch_size).to(torch.long)
         visible = (
@@ -162,7 +162,169 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
             & (patch_y >= 0)
             & (patch_y < patch_h)
         )
-        return patch_y, patch_x, visible
+        return patch_y, patch_x, visible, depth
+
+    def _project_voxels_to_image_coords(
+        self,
+        voxel_coords: torch.Tensor,
+        voxel_batch_ids: torch.Tensor,
+        intrinsics: torch.Tensor,
+        camera_to_world: torch.Tensor,
+    ):
+        xyz1 = torch.cat([voxel_coords, torch.ones_like(voxel_coords[..., :1])], dim=-1)
+        world_to_camera = torch.inverse(camera_to_world)[voxel_batch_ids]
+        cam_coords = torch.matmul(world_to_camera, xyz1[:, None, :, None]).squeeze(-1)[..., :3]
+        img_coords = torch.matmul(intrinsics[voxel_batch_ids], cam_coords.unsqueeze(-1)).squeeze(-1)
+        depth = img_coords[..., 2]
+        safe_depth = torch.clamp(depth, min=1e-5)
+        u = img_coords[..., 0] / safe_depth
+        v = img_coords[..., 1] / safe_depth
+        return u, v, depth
+
+    def _z_buffer_patch_features(
+        self,
+        voxel_tokens: torch.Tensor,
+        voxel_batch_ids: torch.Tensor,
+        patch_y: torch.Tensor,
+        patch_x: torch.Tensor,
+        visible: torch.Tensor,
+        depth: torch.Tensor,
+        batch_size: int,
+        frame_count: int,
+        patch_w: int,
+        patch_count: int,
+    ) -> torch.Tensor:
+        channels = voxel_tokens.shape[-1]
+        flat_output_size = batch_size * frame_count * self.cam_num * patch_count
+        flat_patch_voxel_features = voxel_tokens.new_zeros((flat_output_size, channels))
+        if voxel_tokens.shape[0] == 0:
+            return flat_patch_voxel_features
+
+        cam_ids = torch.arange(
+            self.cam_num, device=voxel_tokens.device, dtype=torch.long
+        ).unsqueeze(0).expand_as(patch_y)
+        flat_visible = visible.reshape(-1)
+        if not torch.any(flat_visible):
+            return flat_patch_voxel_features
+
+        flat_patch_index = (patch_y * patch_w + patch_x).reshape(-1)
+        flat_voxel_batch_ids = voxel_batch_ids.unsqueeze(1).expand(-1, self.cam_num).reshape(-1)
+        flat_cam_ids = cam_ids.reshape(-1)
+        flat_output_index = (
+            ((flat_voxel_batch_ids * self.cam_num + flat_cam_ids) * patch_count) + flat_patch_index
+        )
+
+        valid_output_index = flat_output_index[flat_visible]
+        valid_features = voxel_tokens.unsqueeze(1).expand(-1, self.cam_num, -1).reshape(-1, channels)[flat_visible]
+        valid_depth = depth.reshape(-1)[flat_visible]
+
+        min_depth = torch.full(
+            (flat_output_size,),
+            torch.finfo(valid_depth.dtype).max,
+            device=valid_depth.device,
+            dtype=valid_depth.dtype,
+        )
+        min_depth.scatter_reduce_(0, valid_output_index, valid_depth, reduce="amin", include_self=True)
+
+        nearest_mask = valid_depth <= (min_depth[valid_output_index] + 1e-6)
+        nearest_positions = torch.nonzero(nearest_mask, as_tuple=False).squeeze(-1)
+        nearest_output_index = valid_output_index[nearest_positions]
+
+        first_position = torch.full(
+            (flat_output_size,),
+            nearest_positions.shape[0],
+            device=valid_output_index.device,
+            dtype=torch.long,
+        )
+        first_position.scatter_reduce_(
+            0,
+            nearest_output_index,
+            nearest_positions,
+            reduce="amin",
+            include_self=True,
+        )
+
+        selected_mask = first_position < nearest_positions.shape[0]
+        if torch.any(selected_mask):
+            flat_patch_voxel_features[selected_mask] = valid_features[first_position[selected_mask]]
+        return flat_patch_voxel_features
+
+    def _select_all_projected_voxels(
+        self,
+        voxel_batch_ids: torch.Tensor,
+        patch_y: torch.Tensor,
+        patch_x: torch.Tensor,
+        visible: torch.Tensor,
+        depth: torch.Tensor,
+        batch_size: int,
+        frame_count: int,
+        patch_w: int,
+        patch_count: int,
+    ) -> dict:
+        flat_output_size = batch_size * frame_count * self.cam_num * patch_count
+        empty_long = torch.zeros((0,), dtype=torch.long, device=voxel_batch_ids.device)
+        empty_depth = depth.new_zeros((0,))
+        if voxel_batch_ids.shape[0] == 0:
+            return {
+                "selected_valid_positions": empty_long,
+                "selected_output_indices": empty_long,
+                "flat_seq_ids": empty_long,
+                "patch_idx": empty_long,
+                "patch_y": empty_long,
+                "patch_x": empty_long,
+                "coord_batch_frame_ids": empty_long,
+                "coord_cam_ids": empty_long,
+                "depth": empty_depth,
+                "flat_output_size": flat_output_size,
+            }
+
+        cam_ids = torch.arange(
+            self.cam_num, device=voxel_batch_ids.device, dtype=torch.long
+        ).unsqueeze(0).expand_as(patch_y)
+        flat_visible = visible.reshape(-1)
+        if not torch.any(flat_visible):
+            return {
+                "selected_valid_positions": empty_long,
+                "selected_output_indices": empty_long,
+                "flat_seq_ids": empty_long,
+                "patch_idx": empty_long,
+                "patch_y": empty_long,
+                "patch_x": empty_long,
+                "coord_batch_frame_ids": empty_long,
+                "coord_cam_ids": empty_long,
+                "depth": empty_depth,
+                "flat_output_size": flat_output_size,
+            }
+
+        flat_patch_index = (patch_y * patch_w + patch_x).reshape(-1)
+        flat_batch_frame_ids = voxel_batch_ids.unsqueeze(1).expand(-1, self.cam_num).reshape(-1)
+        flat_cam_ids = cam_ids.reshape(-1)
+        valid_patch_index = flat_patch_index[flat_visible]
+        valid_output_index = (
+            ((flat_batch_frame_ids[flat_visible] * self.cam_num + flat_cam_ids[flat_visible]) * patch_count)
+            + valid_patch_index
+        )
+        valid_depth = depth.reshape(-1)[flat_visible]
+        valid_batch_frame_ids = flat_batch_frame_ids[flat_visible]
+        valid_cam_ids = flat_cam_ids[flat_visible]
+        selected_valid_positions = torch.arange(valid_output_index.shape[0], device=valid_output_index.device, dtype=torch.long)
+
+        batch_ids = valid_batch_frame_ids // frame_count
+        frame_ids = valid_batch_frame_ids % frame_count
+        flat_seq_ids = (batch_ids * self.cam_num + valid_cam_ids) * frame_count + frame_ids
+
+        return {
+            "selected_valid_positions": selected_valid_positions,
+            "selected_output_indices": valid_output_index,
+            "flat_seq_ids": flat_seq_ids,
+            "patch_idx": valid_patch_index,
+            "patch_y": valid_patch_index // patch_w,
+            "patch_x": valid_patch_index % patch_w,
+            "coord_batch_frame_ids": valid_batch_frame_ids,
+            "coord_cam_ids": valid_cam_ids,
+            "depth": valid_depth,
+            "flat_output_size": flat_output_size,
+        }
 
     def _world_points_to_local(self, points: torch.Tensor, point_mask: torch.Tensor, lidar_to_world: torch.Tensor):
         valid_indices = torch.nonzero(point_mask, as_tuple=False)
@@ -239,10 +401,11 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
         if voxel_tokens.shape[0] == 0:
             return voxel_tokens.new_zeros((batch_size * frame_count, self.cam_num, patch_count, channels))
 
+        flat_seq_count = batch_size * frame_count * self.cam_num
         voxel_batch_ids = voxel_coords[:, 0].long()
         if lidar_to_world is not None:
             voxel_centers = self._local_voxel_centers_to_world(voxel_centers, voxel_batch_ids, lidar_to_world)
-        patch_y, patch_x, visible = self._project_voxels_to_patches(
+        patch_y, patch_x, visible, depth = self._project_voxels_to_patches(
             voxel_centers,
             voxel_batch_ids,
             intrinsics,
@@ -250,31 +413,351 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
             patch_h,
             patch_w,
         )
+        projection_selection = self._select_projected_voxels(
+            voxel_batch_ids=voxel_batch_ids,
+            patch_y=patch_y,
+            patch_x=patch_x,
+            visible=visible,
+            depth=depth,
+            batch_size=batch_size,
+            frame_count=frame_count,
+            patch_w=patch_w,
+            patch_count=patch_count,
+        )
+        selected_valid_positions = projection_selection["selected_valid_positions"]
+        if selected_valid_positions.numel() == 0:
+            return voxel_tokens.new_zeros((batch_size * frame_count, self.cam_num, patch_count, channels))
 
-        cam_ids = torch.arange(self.cam_num, device=voxel_tokens.device, dtype=torch.long).unsqueeze(0).expand_as(patch_y)
-        flat_visible = visible.reshape(-1)
-        flat_patch_index = (patch_y * patch_w + patch_x).reshape(-1)
-        flat_voxel_batch_ids = voxel_batch_ids.unsqueeze(1).expand(-1, self.cam_num).reshape(-1)
-        flat_cam_ids = cam_ids.reshape(-1)
-        flat_features = voxel_tokens.unsqueeze(1).expand(-1, self.cam_num, -1).reshape(-1, channels)
+        flat_voxel_tokens = voxel_tokens.unsqueeze(1).expand(-1, self.cam_num, -1).reshape(-1, channels)
+        valid_voxel_tokens = flat_voxel_tokens[visible.reshape(-1)]
+        selected_voxel_tokens = valid_voxel_tokens[selected_valid_positions]
+        dense_patch_voxel_tokens = self._scatter_projected_tokens_to_dense_grid(
+            projected_tokens=selected_voxel_tokens,
+            flat_seq_ids=projection_selection["flat_seq_ids"],
+            patch_idx=projection_selection["patch_idx"],
+            flat_seq_count=flat_seq_count,
+            patch_count=patch_count,
+        )
+        return dense_patch_voxel_tokens.reshape(batch_size * frame_count, self.cam_num, patch_count, channels)
 
+    def _enable_early_patch_fusion(self) -> bool:
+        return False
+
+    def _project_early_voxel_features(self, voxel_features: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("Early fusion models must implement `_project_early_voxel_features`.")
+
+    def _select_z_buffer_projected_voxels(
+        self,
+        voxel_batch_ids: torch.Tensor,
+        patch_y: torch.Tensor,
+        patch_x: torch.Tensor,
+        visible: torch.Tensor,
+        depth: torch.Tensor,
+        batch_size: int,
+        frame_count: int,
+        patch_w: int,
+        patch_count: int,
+    ) -> dict:
         flat_output_size = batch_size * frame_count * self.cam_num * patch_count
+        empty_long = torch.zeros((0,), dtype=torch.long, device=voxel_batch_ids.device)
+        empty_depth = depth.new_zeros((0,))
+        if voxel_batch_ids.shape[0] == 0:
+            return {
+                "selected_valid_positions": empty_long,
+                "selected_output_indices": empty_long,
+                "flat_seq_ids": empty_long,
+                "patch_idx": empty_long,
+                "patch_y": empty_long,
+                "patch_x": empty_long,
+                "coord_batch_frame_ids": empty_long,
+                "coord_cam_ids": empty_long,
+                "depth": empty_depth,
+                "flat_output_size": flat_output_size,
+            }
+
+        cam_ids = torch.arange(
+            self.cam_num, device=voxel_batch_ids.device, dtype=torch.long
+        ).unsqueeze(0).expand_as(patch_y)
+        flat_visible = visible.reshape(-1)
+        if not torch.any(flat_visible):
+            return {
+                "selected_valid_positions": empty_long,
+                "selected_output_indices": empty_long,
+                "flat_seq_ids": empty_long,
+                "patch_idx": empty_long,
+                "patch_y": empty_long,
+                "patch_x": empty_long,
+                "coord_batch_frame_ids": empty_long,
+                "coord_cam_ids": empty_long,
+                "depth": empty_depth,
+                "flat_output_size": flat_output_size,
+            }
+
+        flat_patch_index = (patch_y * patch_w + patch_x).reshape(-1)
+        flat_batch_frame_ids = voxel_batch_ids.unsqueeze(1).expand(-1, self.cam_num).reshape(-1)
+        flat_cam_ids = cam_ids.reshape(-1)
         flat_output_index = (
-            ((flat_voxel_batch_ids * self.cam_num + flat_cam_ids) * patch_count) + flat_patch_index
+            ((flat_batch_frame_ids * self.cam_num + flat_cam_ids) * patch_count) + flat_patch_index
         )
 
-        flat_patch_voxel_features = voxel_tokens.new_zeros((flat_output_size, channels))
-        flat_patch_voxel_counts = voxel_tokens.new_zeros((flat_output_size, 1))
         valid_output_index = flat_output_index[flat_visible]
-        flat_patch_voxel_features.index_add_(0, valid_output_index, flat_features[flat_visible])
-        flat_patch_voxel_counts.index_add_(
+        valid_depth = depth.reshape(-1)[flat_visible]
+        valid_batch_frame_ids = flat_batch_frame_ids[flat_visible]
+        valid_cam_ids = flat_cam_ids[flat_visible]
+
+        min_depth = torch.full(
+            (flat_output_size,),
+            torch.finfo(valid_depth.dtype).max,
+            device=valid_depth.device,
+            dtype=valid_depth.dtype,
+        )
+        min_depth.scatter_reduce_(0, valid_output_index, valid_depth, reduce="amin", include_self=True)
+
+        nearest_mask = valid_depth <= (min_depth[valid_output_index] + 1e-6)
+        nearest_positions = torch.nonzero(nearest_mask, as_tuple=False).squeeze(-1)
+        nearest_output_index = valid_output_index[nearest_positions]
+
+        first_position = torch.full(
+            (flat_output_size,),
+            nearest_positions.shape[0],
+            device=valid_output_index.device,
+            dtype=torch.long,
+        )
+        first_position.scatter_reduce_(
             0,
-            valid_output_index,
-            torch.ones((valid_output_index.shape[0], 1), device=voxel_tokens.device, dtype=voxel_tokens.dtype),
+            nearest_output_index,
+            nearest_positions,
+            reduce="amin",
+            include_self=True,
         )
 
-        flat_patch_voxel_features = flat_patch_voxel_features / flat_patch_voxel_counts.clamp_min(1.0)
-        return flat_patch_voxel_features.reshape(batch_size * frame_count, self.cam_num, patch_count, channels)
+        selected_output_mask = first_position < nearest_positions.shape[0]
+        selected_output_indices = torch.nonzero(selected_output_mask, as_tuple=False).squeeze(-1)
+        selected_valid_positions = first_position[selected_output_mask]
+
+        batch_frame_ids = selected_output_indices // (self.cam_num * patch_count)
+        rem = selected_output_indices % (self.cam_num * patch_count)
+        selected_cam_ids = rem // patch_count
+        selected_patch_idx = rem % patch_count
+        batch_ids = batch_frame_ids // frame_count
+        frame_ids = batch_frame_ids % frame_count
+        flat_seq_ids = (batch_ids * self.cam_num + selected_cam_ids) * frame_count + frame_ids
+
+        return {
+            "selected_valid_positions": selected_valid_positions,
+            "selected_output_indices": selected_output_indices,
+            "flat_seq_ids": flat_seq_ids,
+            "patch_idx": selected_patch_idx,
+            "patch_y": selected_patch_idx // patch_w,
+            "patch_x": selected_patch_idx % patch_w,
+            "coord_batch_frame_ids": valid_batch_frame_ids[selected_valid_positions],
+            "coord_cam_ids": valid_cam_ids[selected_valid_positions],
+            "depth": valid_depth[selected_valid_positions],
+            "flat_output_size": flat_output_size,
+        }
+
+    def _select_projected_voxels(
+        self,
+        voxel_batch_ids: torch.Tensor,
+        patch_y: torch.Tensor,
+        patch_x: torch.Tensor,
+        visible: torch.Tensor,
+        depth: torch.Tensor,
+        batch_size: int,
+        frame_count: int,
+        patch_w: int,
+        patch_count: int,
+    ) -> dict:
+        if self.use_z_buffer_projection:
+            return self._select_z_buffer_projected_voxels(
+                voxel_batch_ids=voxel_batch_ids,
+                patch_y=patch_y,
+                patch_x=patch_x,
+                visible=visible,
+                depth=depth,
+                batch_size=batch_size,
+                frame_count=frame_count,
+                patch_w=patch_w,
+                patch_count=patch_count,
+            )
+        return self._select_all_projected_voxels(
+            voxel_batch_ids=voxel_batch_ids,
+            patch_y=patch_y,
+            patch_x=patch_x,
+            visible=visible,
+            depth=depth,
+            batch_size=batch_size,
+            frame_count=frame_count,
+            patch_w=patch_w,
+            patch_count=patch_count,
+        )
+
+    def _scatter_projected_tokens_to_dense_grid(
+        self,
+        projected_tokens: torch.Tensor,
+        flat_seq_ids: torch.Tensor,
+        patch_idx: torch.Tensor,
+        flat_seq_count: int,
+        patch_count: int,
+    ) -> torch.Tensor:
+        channels = projected_tokens.shape[-1]
+        dense_patch_tokens = projected_tokens.new_zeros((flat_seq_count * patch_count, channels))
+        if projected_tokens.shape[0] == 0:
+            return dense_patch_tokens.reshape(flat_seq_count, patch_count, channels)
+
+        dense_indices = flat_seq_ids * patch_count + patch_idx
+        dense_patch_tokens.index_add_(0, dense_indices, projected_tokens)
+
+        dense_counts = projected_tokens.new_zeros((flat_seq_count * patch_count, 1))
+        dense_counts.index_add_(
+            0,
+            dense_indices,
+            projected_tokens.new_ones((projected_tokens.shape[0], 1)),
+        )
+
+        nonzero_mask = dense_counts.squeeze(-1) > 0
+        dense_patch_tokens[nonzero_mask] = dense_patch_tokens[nonzero_mask] / dense_counts[nonzero_mask]
+        return dense_patch_tokens.reshape(flat_seq_count, patch_count, channels)
+
+    def _prepare_common_early_fusion_inputs(self, others: dict, batch_size: int, frame_count: int, image_hw):
+        points = others["points"].reshape(batch_size * frame_count, others["points"].shape[2], others["points"].shape[3])
+        point_mask = others["point_mask"].reshape(batch_size * frame_count, others["point_mask"].shape[2])
+        intrinsics = others["intrinsics"].reshape(batch_size, frame_count, self.cam_num, 3, 3).reshape(batch_size * frame_count, self.cam_num, 3, 3)
+        camera_to_world = others["camera_to_world"].reshape(batch_size, frame_count, self.cam_num, 4, 4).reshape(batch_size * frame_count, self.cam_num, 4, 4)
+        lidar_to_world = None
+        if "lidar_to_world" in others:
+            lidar_to_world = others["lidar_to_world"].reshape(batch_size * frame_count, 4, 4)
+
+        patch_h = image_hw[0] // self.patch_size
+        patch_w = image_hw[1] // self.patch_size
+        patch_count = patch_h * patch_w
+
+        voxel_features, voxel_coords = self._encode_voxels(points, point_mask, lidar_to_world=lidar_to_world)
+        voxel_tokens = self._project_early_voxel_features(voxel_features)
+        channels = voxel_tokens.shape[-1]
+        flat_seq_count = batch_size * frame_count * self.cam_num
+
+        empty_long = torch.zeros((0,), dtype=torch.long, device=points.device)
+        empty_float = points.new_zeros((0,))
+        empty_voxel_tokens = voxel_tokens.new_zeros((0, channels))
+        dense_patch_voxel_tokens = voxel_tokens.new_zeros((flat_seq_count, patch_count, channels))
+        if voxel_tokens.shape[0] == 0:
+            return {
+                "voxel_tokens": empty_voxel_tokens,
+                "flat_seq_ids": empty_long,
+                "patch_idx": empty_long,
+                "patch_y": empty_long,
+                "patch_x": empty_long,
+                "coord_y": empty_float,
+                "coord_x": empty_float,
+                "depth": empty_float,
+                "patch_h": patch_h,
+                "patch_w": patch_w,
+                "patch_count": patch_count,
+                "dense_patch_voxel_tokens": dense_patch_voxel_tokens,
+            }
+
+        voxel_centers = self._voxel_coords_to_centers(voxel_coords)
+        voxel_batch_ids = voxel_coords[:, 0].long()
+        if lidar_to_world is not None:
+            voxel_centers = self._local_voxel_centers_to_world(voxel_centers, voxel_batch_ids, lidar_to_world)
+
+        u, v, depth = self._project_voxels_to_image_coords(
+            voxel_centers,
+            voxel_batch_ids,
+            intrinsics,
+            camera_to_world,
+        )
+        patch_y, patch_x, visible, _ = self._project_voxels_to_patches(
+            voxel_centers,
+            voxel_batch_ids,
+            intrinsics,
+            camera_to_world,
+            patch_h,
+            patch_w,
+        )
+        projection_selection = self._select_projected_voxels(
+            voxel_batch_ids=voxel_batch_ids,
+            patch_y=patch_y,
+            patch_x=patch_x,
+            visible=visible,
+            depth=depth,
+            batch_size=batch_size,
+            frame_count=frame_count,
+            patch_w=patch_w,
+            patch_count=patch_count,
+        )
+
+        selected_valid_positions = projection_selection["selected_valid_positions"]
+        if selected_valid_positions.numel() == 0:
+            return {
+                "voxel_tokens": empty_voxel_tokens,
+                "flat_seq_ids": empty_long,
+                "patch_idx": empty_long,
+                "patch_y": empty_long,
+                "patch_x": empty_long,
+                "coord_y": empty_float,
+                "coord_x": empty_float,
+                "depth": empty_float,
+                "patch_h": patch_h,
+                "patch_w": patch_w,
+                "patch_count": patch_count,
+                "dense_patch_voxel_tokens": dense_patch_voxel_tokens,
+            }
+
+        flat_voxel_tokens = voxel_tokens.unsqueeze(1).expand(-1, self.cam_num, -1).reshape(-1, channels)
+        flat_u = u.reshape(-1)
+        flat_v = v.reshape(-1)
+        flat_depth = depth.reshape(-1)
+        flat_visible = visible.reshape(-1)
+
+        valid_voxel_tokens = flat_voxel_tokens[flat_visible]
+        valid_u = flat_u[flat_visible]
+        valid_v = flat_v[flat_visible]
+        valid_depth = flat_depth[flat_visible]
+
+        selected_voxel_tokens = valid_voxel_tokens[selected_valid_positions]
+        selected_coord_x = valid_u[selected_valid_positions]
+        selected_coord_y = valid_v[selected_valid_positions]
+        selected_depth = valid_depth[selected_valid_positions]
+        dense_patch_voxel_tokens = self._scatter_projected_tokens_to_dense_grid(
+            projected_tokens=selected_voxel_tokens,
+            flat_seq_ids=projection_selection["flat_seq_ids"],
+            patch_idx=projection_selection["patch_idx"],
+            flat_seq_count=flat_seq_count,
+            patch_count=patch_count,
+        )
+
+        return {
+            "voxel_tokens": selected_voxel_tokens,
+            "flat_seq_ids": projection_selection["flat_seq_ids"],
+            "patch_idx": projection_selection["patch_idx"],
+            "patch_y": projection_selection["patch_y"],
+            "patch_x": projection_selection["patch_x"],
+            "coord_y": selected_coord_y,
+            "coord_x": selected_coord_x,
+            "depth": selected_depth,
+            "patch_h": patch_h,
+            "patch_w": patch_w,
+            "patch_count": patch_count,
+            "dense_patch_voxel_tokens": dense_patch_voxel_tokens,
+        }
+
+    def _apply_early_patch_fusion(
+        self,
+        patch_tokens: torch.Tensor,
+        fusion_inputs: dict,
+        image_hw,
+    ) -> torch.Tensor:
+        return patch_tokens
+
+    def _prepare_aggregator_patch_tokens(self, images: torch.Tensor, others: dict, batch_size: int, frame_count: int, image_hw):
+        if not self._enable_early_patch_fusion():
+            return None
+
+        patch_tokens = self.aggregator.extract_patch_tokens(images)
+        fusion_inputs = self._prepare_common_early_fusion_inputs(others, batch_size, frame_count, image_hw)
+        return self._apply_early_patch_fusion(patch_tokens, fusion_inputs, image_hw)
 
     def _mix_patch_tokens(self, patch_tokens: torch.Tensor, patch_voxel_features: torch.Tensor, layer_idx: int):
         batch_size, sequence_length, patch_count, channels = patch_tokens.shape
@@ -286,21 +769,20 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
         fused_tokens = fused_tokens.reshape(batch_size, frame_count, self.cam_num, patch_count, channels)
         return fused_tokens.reshape(batch_size, sequence_length, patch_count, channels)
 
-    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None, others=None):
-        if len(images.shape) == 4:
-            images = images.unsqueeze(0)
-        batch_size, sequence_length, _, image_h, image_w = images.size()
-        frame_count = sequence_length // self.cam_num
-        images_time_major = images
-
-        images = images.reshape(batch_size, frame_count, self.cam_num, 3, image_h, image_w)
-        images = images.permute(0, 2, 1, 3, 4, 5).contiguous().reshape(batch_size * self.cam_num, frame_count, 3, image_h, image_w)
-        if query_points is not None and len(query_points.shape) == 2:
-            query_points = query_points.unsqueeze(0)
-
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
-        images = images.view(batch_size, sequence_length, 3, image_h, image_w)
-
+    def _forward_from_aggregator_outputs(
+        self,
+        aggregated_tokens_list,
+        patch_start_idx: int,
+        images: torch.Tensor,
+        images_time_major: torch.Tensor,
+        batch_size: int,
+        sequence_length: int,
+        frame_count: int,
+        image_h: int,
+        image_w: int,
+        query_points: torch.Tensor = None,
+        others=None,
+    ):
         real_world_extrinsics = others["extrinsics"]
         real_world_extrinsics_enc = extri_to_pose_encoding(real_world_extrinsics)
         real_world_extrinsics_enc = real_world_extrinsics_enc.reshape(batch_size, frame_count, self.cam_num, 7).permute(0, 2, 1, 3)
@@ -407,3 +889,41 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
 
         predictions["images"] = images_time_major
         return predictions
+
+    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None, others=None):
+        if len(images.shape) == 4:
+            images = images.unsqueeze(0)
+        batch_size, sequence_length, _, image_h, image_w = images.size()
+        frame_count = sequence_length // self.cam_num
+        images_time_major = images
+
+        images = images.reshape(batch_size, frame_count, self.cam_num, 3, image_h, image_w)
+        images = images.permute(0, 2, 1, 3, 4, 5).contiguous().reshape(batch_size * self.cam_num, frame_count, 3, image_h, image_w)
+        if query_points is not None and len(query_points.shape) == 2:
+            query_points = query_points.unsqueeze(0)
+
+        patch_tokens = self._prepare_aggregator_patch_tokens(
+            images,
+            others,
+            batch_size,
+            frame_count,
+            (image_h, image_w),
+        )
+        if patch_tokens is None:
+            aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        else:
+            aggregated_tokens_list, patch_start_idx = self.aggregator(images, patch_tokens=patch_tokens)
+        images = images.view(batch_size, sequence_length, 3, image_h, image_w)
+        return self._forward_from_aggregator_outputs(
+            aggregated_tokens_list=aggregated_tokens_list,
+            patch_start_idx=patch_start_idx,
+            images=images,
+            images_time_major=images_time_major,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            frame_count=frame_count,
+            image_h=image_h,
+            image_w=image_w,
+            query_points=query_points,
+            others=others,
+        )

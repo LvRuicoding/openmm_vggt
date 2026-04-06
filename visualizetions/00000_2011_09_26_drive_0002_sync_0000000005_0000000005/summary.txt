@@ -1,0 +1,9 @@
+sequence: 2011_09_26_drive_0002_sync_0000000005_0000000005
+sample_index: 0
+image_hw: 280x518
+patch_size: 14
+voxel_size: (0.4000000059604645, 0.4000000059604645, 0.800000011920929)
+point_cloud_range: (0.0, -40.0, -3.0, 80.0, 40.0, 3.0)
+frame 0: raw_points=32768 voxels=3833
+frame 1: raw_points=32768 voxels=3833
+frame 2: raw_points=32768 voxels=3833

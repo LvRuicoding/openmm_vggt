@@ -19,6 +19,7 @@ model = dict(
     voxel_size=(0.4, 0.4, 0.8),
     point_cloud_range=(0.0, -40.0, -3.0, 80.0, 40.0, 3.0),
     serializer_grid_size_2d=14.0,
+    use_z_buffer_projection=True,
     fusion_num_heads=16,
 )
 
