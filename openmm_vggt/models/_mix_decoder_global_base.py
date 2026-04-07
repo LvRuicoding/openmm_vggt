@@ -36,6 +36,30 @@ class SimplePatchFusion(nn.Module):
         return patch_tokens + gate * voxel_features
 
 
+def replace_patch_tokens(
+    tokens: torch.Tensor,
+    patch_tokens: torch.Tensor,
+    patch_start_idx: int,
+) -> torch.Tensor:
+    if tokens.shape[:-2] != patch_tokens.shape[:-2]:
+        raise ValueError(
+            f"Token prefix shape mismatch: tokens {tuple(tokens.shape)} vs patch tokens {tuple(patch_tokens.shape)}"
+        )
+    if tokens.shape[-1] != patch_tokens.shape[-1]:
+        raise ValueError(
+            f"Token channel mismatch: tokens {tuple(tokens.shape)} vs patch tokens {tuple(patch_tokens.shape)}"
+        )
+    if tokens.shape[-2] - patch_start_idx != patch_tokens.shape[-2]:
+        raise ValueError(
+            f"Patch token count mismatch: tokens {tuple(tokens.shape)} vs patch tokens {tuple(patch_tokens.shape)} "
+            f"with patch_start_idx={patch_start_idx}"
+        )
+
+    if patch_start_idx == 0:
+        return patch_tokens
+    return torch.cat([tokens[..., :patch_start_idx, :], patch_tokens], dim=-2)
+
+
 class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
     def __init__(
         self,
@@ -492,7 +516,14 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
         dense_patch_tokens[nonzero_mask] = dense_patch_tokens[nonzero_mask] / dense_counts[nonzero_mask]
         return dense_patch_tokens.reshape(flat_seq_count, patch_count, channels)
 
-    def _prepare_common_early_fusion_inputs(self, others: dict, batch_size: int, frame_count: int, image_hw):
+    def _prepare_common_patch_fusion_inputs(
+        self,
+        others: dict,
+        batch_size: int,
+        frame_count: int,
+        image_hw,
+        project_voxel_features_fn,
+    ):
         points = others["points"].reshape(batch_size * frame_count, others["points"].shape[2], others["points"].shape[3])
         point_mask = others["point_mask"].reshape(batch_size * frame_count, others["point_mask"].shape[2])
         intrinsics = others["intrinsics"].reshape(batch_size, frame_count, self.cam_num, 3, 3).reshape(batch_size * frame_count, self.cam_num, 3, 3)
@@ -506,7 +537,7 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
         patch_count = patch_h * patch_w
 
         voxel_features, voxel_coords = self._encode_voxels(points, point_mask, lidar_to_world=lidar_to_world)
-        voxel_tokens = self._project_early_voxel_features(voxel_features)
+        voxel_tokens = project_voxel_features_fn(voxel_features)
         channels = voxel_tokens.shape[-1]
         flat_seq_count = batch_size * frame_count * self.cam_num
 
@@ -616,6 +647,15 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
             "dense_patch_voxel_tokens": dense_patch_voxel_tokens,
         }
 
+    def _prepare_common_early_fusion_inputs(self, others: dict, batch_size: int, frame_count: int, image_hw):
+        return self._prepare_common_patch_fusion_inputs(
+            others=others,
+            batch_size=batch_size,
+            frame_count=frame_count,
+            image_hw=image_hw,
+            project_voxel_features_fn=self._project_early_voxel_features,
+        )
+
     def _apply_early_patch_fusion(
         self,
         patch_tokens: torch.Tensor,
@@ -631,6 +671,53 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
         patch_tokens = self.aggregator.extract_patch_tokens(images)
         fusion_inputs = self._prepare_common_early_fusion_inputs(others, batch_size, frame_count, image_hw)
         return self._apply_early_patch_fusion(patch_tokens, fusion_inputs, image_hw)
+
+    def _enable_final_layer_patch_fusion(self) -> bool:
+        return False
+
+    def _project_final_layer_voxel_features(self, voxel_features: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("Late fusion models must implement `_project_final_layer_voxel_features`.")
+
+    def _prepare_final_layer_fusion_inputs(self, others: dict, batch_size: int, frame_count: int, image_hw):
+        if not self._enable_final_layer_patch_fusion():
+            return None
+        return self._prepare_common_patch_fusion_inputs(
+            others=others,
+            batch_size=batch_size,
+            frame_count=frame_count,
+            image_hw=image_hw,
+            project_voxel_features_fn=self._project_final_layer_voxel_features,
+        )
+
+    def _apply_final_layer_patch_fusion(
+        self,
+        patch_tokens: torch.Tensor,
+        fusion_inputs: dict,
+        image_hw,
+    ) -> torch.Tensor:
+        return patch_tokens
+
+    def _fuse_final_aggregator_layer(
+        self,
+        aggregated_tokens_list,
+        patch_start_idx: int,
+        fusion_inputs: dict,
+        image_hw,
+    ):
+        if not aggregated_tokens_list or fusion_inputs is None:
+            return aggregated_tokens_list
+
+        fused_layers = list(aggregated_tokens_list)
+        last_layer_tokens = fused_layers[-1]
+        last_layer_patch_tokens = last_layer_tokens[..., patch_start_idx:, :]
+        flat_patch_tokens = last_layer_patch_tokens.reshape(-1, last_layer_patch_tokens.shape[-2], last_layer_patch_tokens.shape[-1])
+        fused_patch_tokens = self._apply_final_layer_patch_fusion(flat_patch_tokens, fusion_inputs, image_hw)
+        fused_layers[-1] = replace_patch_tokens(
+            last_layer_tokens,
+            fused_patch_tokens.reshape_as(last_layer_patch_tokens),
+            patch_start_idx=patch_start_idx,
+        )
+        return fused_layers
 
     def _forward_from_aggregator_outputs(
         self,
@@ -675,6 +762,19 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
             pos = pos + 1
             pos_special = torch.zeros(batch_size * sequence_length, 2, 2, device=images.device, dtype=pos.dtype)
             pos = torch.cat([pos_special, pos], dim=1)
+
+        final_layer_fusion_inputs = self._prepare_final_layer_fusion_inputs(
+            others=others,
+            batch_size=batch_size,
+            frame_count=frame_count,
+            image_hw=(image_h, image_w),
+        )
+        aggregated_tokens_list = self._fuse_final_aggregator_layer(
+            aggregated_tokens_list=aggregated_tokens_list,
+            patch_start_idx=patch_start_idx,
+            fusion_inputs=final_layer_fusion_inputs,
+            image_hw=(image_h, image_w),
+        )
 
         last_pose_enc = aggregated_tokens_list[-1][..., 0, :]
         selected_layers = [aggregated_tokens_list[i] for i in self.selected_list]

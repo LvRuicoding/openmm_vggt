@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 from collections import defaultdict
@@ -321,6 +322,13 @@ def save_checkpoint(path: Path, model, optimizer, scheduler, epoch, step, cfg, s
     }, path)
 
 
+def append_loss_record(loss_file, step: int, loss: float) -> None:
+    if loss_file is None:
+        return
+    loss_file.write(json.dumps({"step": step, "loss": loss}) + "\n")
+    loss_file.flush()
+
+
 # ---------------------------------------------------------------------------
 # main training function
 # ---------------------------------------------------------------------------
@@ -397,7 +405,9 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
     )
 
     output_dir = Path(cfg.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(output_dir / "tb")) if is_main_process() else None
+    loss_file = (output_dir / "loss_steps.jsonl").open("w", encoding="utf-8") if is_main_process() else None
 
     scaler = torch.cuda.amp.GradScaler(enabled=cfg.get("amp", True) and device.type == "cuda")
     best_val = float("inf")
@@ -480,6 +490,7 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
             for key, value in metrics.items():
                 running[key] = running.get(key, 0.0) + value
             global_step += 1
+            append_loss_record(loss_file, global_step, metrics["loss"])
             num_batches += 1
 
             cur_lr = optimizer.param_groups[0]["lr"]
@@ -544,6 +555,8 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
 
     if writer is not None:
         writer.close()
+    if loss_file is not None:
+        loss_file.close()
     cleanup_distributed()
 
 
