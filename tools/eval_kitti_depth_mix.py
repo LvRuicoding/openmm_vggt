@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
-"""Evaluate mix_decoder_global_window_attn_early on KITTI depth completion val split.
+"""Evaluate mix_decoder_global_early on KITTI depth completion val split.
 
-This mirrors tools/eval_kitti_depth_stereo_mix.py but defaults to the
-window-attention early-fusion config/checkpoint.
+This mirrors tools/eval_kitti_depth_stereo.py but feeds the additional LiDAR
+inputs required by mix_decoder_global_early:
+  - camera_to_world
+  - lidar_to_world
+  - points
+  - point_mask
 
 Usage:
-  python tools/eval_kitti_depth_stereo_mix_window_attn_early.py \
-      configs/kitti_depth_stereo_mix_window_attn_early_ft.py \
-      --checkpoint trainoutput/kitti_depth_stereo_mix_window_attn_early_ft/epoch_002.pth
+  python tools/eval_kitti_depth_stereo_mix.py \
+      configs/early/kitti_depth_stereo_mix_ft.py \
+      --checkpoint trainoutput/kitti_depth_stereo_mix_early_ft/last.pth
+
+  torchrun --nproc_per_node=4 tools/eval_kitti_depth_mix.py \
+      configs/early/kitti_depth_stereo_mix_ft.py \
+      --checkpoint trainoutput/kitti_depth_stereo_mix_early_ft/last.pth --batch-size 4
 """
 from __future__ import annotations
 
@@ -36,7 +44,8 @@ from openmm_vggt.utils.geometry import closed_form_inverse_se3
 
 
 DEFAULT_EVAL_CHECKPOINT_NAME = "epoch_002.pth"
-DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "kitti_depth_stereo_mix_window_attn_early_ft.py"
+DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "early" / "kitti_depth_stereo_mix_ft.py"
+DEFAULT_DESCRIPTION = "Evaluate mix_decoder_global_early on KITTI depth completion val split."
 
 
 def is_dist() -> bool:
@@ -256,6 +265,19 @@ def duplicate_singleton_batch(batch: Dict[str, torch.Tensor]) -> Dict[str, torch
     return {key: torch.cat([value, value], dim=0) for key, value in batch.items()}
 
 
+def find_latest_epoch_checkpoint(output_dir: Path) -> Optional[Path]:
+    epoch_ckpts = []
+    for path in output_dir.glob("epoch_*.pth"):
+        stem = path.stem
+        suffix = stem[len("epoch_"):]
+        if suffix.isdigit():
+            epoch_ckpts.append((int(suffix), path))
+    if not epoch_ckpts:
+        return None
+    epoch_ckpts.sort(key=lambda item: item[0], reverse=True)
+    return epoch_ckpts[0][1]
+
+
 def resolve_checkpoint_path(args: argparse.Namespace, cfg: Config) -> str:
     if args.checkpoint is not None:
         return str(args.checkpoint)
@@ -264,15 +286,23 @@ def resolve_checkpoint_path(args: argparse.Namespace, cfg: Config) -> str:
         return str(cfg_eval_checkpoint)
     output_dir = cfg.get("output_dir", None)
     if output_dir is not None:
-        epoch_002_path = Path(output_dir) / DEFAULT_EVAL_CHECKPOINT_NAME
-        if epoch_002_path.is_file():
-            return str(epoch_002_path)
+        output_dir = Path(output_dir)
+        for candidate_name in ("last.pth", "best.pth"):
+            candidate_path = output_dir / candidate_name
+            if candidate_path.is_file():
+                return str(candidate_path)
+        latest_epoch_path = find_latest_epoch_checkpoint(output_dir)
+        if latest_epoch_path is not None:
+            return str(latest_epoch_path)
+        default_epoch_path = output_dir / DEFAULT_EVAL_CHECKPOINT_NAME
+        if default_epoch_path.is_file():
+            return str(default_epoch_path)
     ckpt_path = cfg.get("checkpoint", None)
     if ckpt_path is not None:
         return str(ckpt_path)
     raise ValueError(
         "No checkpoint specified. Use --checkpoint, set eval_checkpoint in config, "
-        f"or ensure output_dir/{DEFAULT_EVAL_CHECKPOINT_NAME} exists."
+        f"or ensure output_dir contains `last.pth`, `best.pth`, or an `epoch_*.pth` checkpoint."
     )
 
 
@@ -326,14 +356,17 @@ def evaluate(
     return local.reduce(device)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(
+    default_config_path: Path | str = DEFAULT_CONFIG_PATH,
+    description: str = DEFAULT_DESCRIPTION,
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate mix_decoder_global_window_attn_early on KITTI depth completion val split."
+        description=description
     )
     parser.add_argument(
         "config",
         nargs="?",
-        default=str(DEFAULT_CONFIG_PATH),
+        default=str(default_config_path),
         help="mmengine config file.",
     )
     parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint .pth to evaluate.")
@@ -358,8 +391,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def main(
+    default_config_path: Path | str = DEFAULT_CONFIG_PATH,
+    description: str = DEFAULT_DESCRIPTION,
+) -> None:
+    args = parse_args(default_config_path=default_config_path, description=description)
     device = setup_distributed()
 
     try:

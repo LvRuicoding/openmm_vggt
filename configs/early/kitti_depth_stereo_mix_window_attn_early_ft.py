@@ -94,7 +94,7 @@ output_dir = '/home/dataset-local/lr/code/openmm_vggt/trainoutput/kitti_depth_st
 epochs = 4
 grad_clip = 1.0
 amp = True
-save_every = 2
+save_every = 1
 log_interval = 10
 seed = 42
 
