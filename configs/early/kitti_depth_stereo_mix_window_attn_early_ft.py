@@ -24,7 +24,7 @@ model = dict(
     fusion_shift_size=(5, 5),
     fusion_num_heads=16,
     fusion_mlp_ratio=4.0,
-    fusion_attn_backend='sdpa',
+    fusion_attn_backend='auto',
 )
 
 image_size = (280, 518)
@@ -98,5 +98,5 @@ save_every = 1
 log_interval = 10
 seed = 42
 
-freeze_modules = ('aggregator', 'camera_head', 'camera_relative_head', 'mv_blocks', 'rel_pose_embed', 'batch_norm', 'layer_norm', 'voxel_encoder')
+freeze_modules = ('aggregator', 'camera_head', 'camera_relative_head', 'mv_blocks', 'rel_pose_embed', 'batch_norm', 'layer_norm')
 freeze_modules_for_epochs = 4
