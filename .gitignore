@@ -4,7 +4,8 @@ ckpt/
 data/
 results/
 visualizations/
-
+visual/
+statics/
 # Python cache
 __pycache__/
 *.py[cod]

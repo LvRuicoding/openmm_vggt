@@ -520,6 +520,7 @@ def evaluate(
     data_loader: DataLoader,
     device: torch.device,
     depth_scale: float = 1.0,
+    max_gt_depth_m: Optional[float] = None,
 ) -> DepthMetrics:
     """Run inference and accumulate metrics on the last-frame stereo pair."""
     local = DepthMetrics()
@@ -558,6 +559,8 @@ def evaluate(
             pred_depth = preds["depth"][: deps.shape[0]].squeeze(-1)
             pred_c = pred_depth[:, last_pair_start:] * depth_scale
             gt_c = deps[:, last_pair_start:]
+            if max_gt_depth_m is not None:
+                gt_c = gt_c.masked_fill(gt_c >= max_gt_depth_m, 0.0)
 
             local.update(pred_c.float(), gt_c.float())
 

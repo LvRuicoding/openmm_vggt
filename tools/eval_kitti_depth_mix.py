@@ -23,6 +23,7 @@ import argparse
 import math
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -306,6 +307,52 @@ def resolve_checkpoint_path(args: argparse.Namespace, cfg: Config) -> str:
     )
 
 
+def format_metrics_report(
+    config_path: str,
+    ckpt_path: str,
+    batch_size: int,
+    num_workers: int,
+    depth_scale: float,
+    metrics: Dict[str, float],
+) -> str:
+    lines = [
+        "KITTI Depth Metrics",
+        f"time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"config: {config_path}",
+        f"checkpoint: {ckpt_path}",
+        f"batch_size: {batch_size}",
+        f"num_workers: {num_workers}",
+        f"depth_scale: {depth_scale}",
+        "",
+    ]
+    for key in ("iRMSE", "iMAE", "RMSE", "MAE", "Abs Rel", "Sq Rel", "SILog", "d1", "d2", "d3"):
+        lines.append(f"{key}: {metrics[key]:.6f}")
+    lines.append(f"n_pixels: {metrics['n_pixels']:.0f}")
+    return "\n".join(lines) + "\n"
+
+
+def save_metrics_report(
+    ckpt_path: str,
+    config_path: str,
+    batch_size: int,
+    num_workers: int,
+    depth_scale: float,
+    metrics: Dict[str, float],
+) -> Path:
+    ckpt = Path(ckpt_path)
+    report_path = ckpt.with_suffix(".txt")
+    report_text = format_metrics_report(
+        config_path=config_path,
+        ckpt_path=ckpt_path,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        depth_scale=depth_scale,
+        metrics=metrics,
+    )
+    report_path.write_text(report_text, encoding="utf-8")
+    return report_path
+
+
 def evaluate(
     model: nn.Module,
     data_loader: DataLoader,
@@ -460,6 +507,15 @@ def main(
             for key in ("iRMSE", "iMAE", "RMSE", "MAE", "Abs Rel", "Sq Rel", "SILog", "d1", "d2", "d3"):
                 print(f"{key:>8s}: {metrics[key]:.6f}", flush=True)
             print(f"{'n_pixels':>8s}: {metrics['n_pixels']:.0f}", flush=True)
+            report_path = save_metrics_report(
+                ckpt_path=ckpt_path,
+                config_path=args.config,
+                batch_size=int(cfg.val_dataloader.get("batch_size", args.batch_size)),
+                num_workers=int(cfg.val_dataloader.get("num_workers", args.num_workers)),
+                depth_scale=depth_scale,
+                metrics=metrics,
+            )
+            print(f"\nSaved metrics to: {report_path}", flush=True)
     finally:
         cleanup_distributed()
 
