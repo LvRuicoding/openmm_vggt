@@ -1,7 +1,20 @@
-# mmengine-style Python config for vKITTI stereo depth fine-tuning.
+# mmengine-style Python config for vKITTI stereo depth fine-tuning (<60m only).
+#
+# This config is based on configs/vkitti_depth_stereo_ft_scaled.py and is meant
+# for the setup where both training loss and evaluation metrics only consider
+# pixels with GT depth < 60m.
+#
+# Current codebase notes:
+# - Evaluation is already supported via tools/eval_vkitti_depth_lt60m.py.
+# - Training code does not yet consume train_max_gt_depth_m automatically; this
+#   config stores the intended threshold so the later training-side change can
+#   read it directly.
 #
 # Run (4 GPUs):
-#   torchrun --nproc_per_node=4 tools/train.py configs/vkitti_depth_stereo_ft_scaled.py
+#   torchrun --nproc_per_node=4 tools/train.py configs/vkitti_depth_stereo_ft_scaled_lt60m.py
+#
+# Eval:
+#   torchrun --nproc_per_node=4 tools/eval_vkitti_depth_lt60m.py configs/vkitti_depth_stereo_ft_scaled_lt60m.py
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -10,6 +23,13 @@ vkitti_root = '/home/dataset-local/lr/code/openmm_vggt/data/vkitti'
 
 train_scenes = ('Scene01', 'Scene02', 'Scene06', 'Scene18')
 val_scenes   = ('Scene20',)
+
+# ---------------------------------------------------------------------------
+# Depth range policy
+# ---------------------------------------------------------------------------
+max_gt_depth_m = 60.0
+train_max_gt_depth_m = max_gt_depth_m
+eval_max_gt_depth_m = max_gt_depth_m
 
 # ---------------------------------------------------------------------------
 # Model
@@ -97,7 +117,7 @@ depth_pred_scale = 20.0
 # Training hyper-parameters
 # ---------------------------------------------------------------------------
 checkpoint = '/home/dataset-local/lr/code/openmm_vggt/ckpt/checkpoint_5.pt'
-output_dir = '/home/dataset-local/lr/code/openmm_vggt/trainoutput/vkitti_depth_stereo_ft_scaled'
+output_dir = '/home/dataset-local/lr/code/openmm_vggt/trainoutput/vkitti_depth_stereo_ft_scaled_lt60m'
 
 epochs       = 24
 grad_clip    = 1.0

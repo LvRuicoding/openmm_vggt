@@ -34,7 +34,7 @@ from eval_kitti_depth import (
 from torch.utils.data import DataLoader
 
 
-DEFAULT_CONFIG = str(REPO_ROOT / "configs" / "vkitti_depth_stereo_ft_scaled.py")
+DEFAULT_CONFIG = str(REPO_ROOT / "configs" / "vkitti_depth_stereo_ft_scaled_lt60m.py")
 MAX_GT_DEPTH_M = 60.0
 
 
