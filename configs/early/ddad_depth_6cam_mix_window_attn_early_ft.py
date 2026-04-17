@@ -82,13 +82,14 @@ camera_weight = 0.0
 pose_translation_weight = 0.0
 pose_rotation_weight = 0.0
 pose_fov_weight = 0.0
+depth_supervision_source = "projected_points"
 
 depth_pred_scale = 20.0
 
 checkpoint = "/home/dataset-local/lr/code/openmm_vggt/ckpt/checkpoint_5.pt"
 output_dir = "/home/dataset-local/lr/code/openmm_vggt/trainoutput/ddad_depth_6cam_mix_window_attn_early_ft"
 
-epochs = 4
+epochs = 24
 grad_clip = 1.0
 amp = True
 save_every = 1
@@ -104,4 +105,4 @@ freeze_modules = (
     "batch_norm",
     "layer_norm",
 )
-freeze_modules_for_epochs = 4
+freeze_modules_for_epochs = 24

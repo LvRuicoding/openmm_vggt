@@ -129,6 +129,98 @@ def matches_prefix(name: str, prefixes: Iterable[str]) -> bool:
     return any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes)
 
 
+def project_points_to_depth_targets(
+    batch: Dict[str, torch.Tensor],
+    supervise_slot_mask: torch.Tensor,
+) -> torch.Tensor:
+    points = batch["points"].float()
+    point_mask = batch["point_mask"].bool()
+    extrinsics = batch["extrinsics"].float()
+    intrinsics = batch["intrinsics"].float()
+    image_h, image_w = batch["images"].shape[-2:]
+
+    batch_size, seq_len = intrinsics.shape[:2]
+    frame_count = points.shape[1]
+    if frame_count <= 0 or seq_len % frame_count != 0:
+        raise ValueError(
+            f"Cannot align points to cameras: seq_len={seq_len}, frame_count={frame_count}"
+        )
+    cam_num = seq_len // frame_count
+
+    gt_depth = intrinsics.new_full((batch_size, seq_len, image_h, image_w), -1.0)
+    slot_indices = torch.nonzero(supervise_slot_mask, as_tuple=False)
+    if slot_indices.numel() == 0:
+        return gt_depth
+
+    slot_batch_ids = slot_indices[:, 0]
+    slot_seq_ids = slot_indices[:, 1]
+    slot_frame_ids = torch.div(slot_seq_ids, cam_num, rounding_mode="floor")
+
+    slot_points = points[slot_batch_ids, slot_frame_ids, :, :3]
+    slot_point_mask = point_mask[slot_batch_ids, slot_frame_ids]
+    slot_intrinsics = intrinsics[slot_batch_ids, slot_seq_ids]
+
+    world_to_camera = extrinsics.new_zeros((batch_size, seq_len, 4, 4))
+    world_to_camera[..., :3, :] = extrinsics
+    world_to_camera[..., 3, 3] = 1.0
+    slot_world_to_camera = world_to_camera[slot_batch_ids, slot_seq_ids]
+
+    xyz1 = torch.cat([slot_points, torch.ones_like(slot_points[..., :1])], dim=-1)
+    cam_coords = torch.matmul(xyz1, slot_world_to_camera.transpose(1, 2))[..., :3]
+
+    depth = cam_coords[..., 2]
+    safe_depth = torch.where(depth > 1e-5, depth, torch.ones_like(depth))
+    image_coords = torch.matmul(cam_coords, slot_intrinsics.transpose(1, 2))
+    u = torch.round(image_coords[..., 0] / safe_depth).to(torch.long)
+    v = torch.round(image_coords[..., 1] / safe_depth).to(torch.long)
+
+    visible = (
+        slot_point_mask
+        & (depth > 1e-5)
+        & (u >= 0)
+        & (u < image_w)
+        & (v >= 0)
+        & (v < image_h)
+    )
+
+    flat_index = v * image_w + u
+    safe_flat_index = torch.where(visible, flat_index, torch.zeros_like(flat_index))
+    scatter_depth = torch.where(visible, depth, depth.new_full((), float("inf")))
+
+    flat_depth = depth.new_full((slot_indices.shape[0], image_h * image_w), float("inf"))
+    flat_depth.scatter_reduce_(1, safe_flat_index, scatter_depth, reduce="amin", include_self=True)
+    hit_mask = torch.isfinite(flat_depth)
+    flat_depth[~hit_mask] = -1.0
+
+    gt_depth[slot_batch_ids, slot_seq_ids] = flat_depth.view(-1, image_h, image_w).to(gt_depth.dtype)
+
+    return gt_depth
+
+
+def build_depth_supervision_target(
+    batch: Dict[str, torch.Tensor],
+    supervision_source: str,
+) -> torch.Tensor:
+    with torch.amp.autocast(device_type=batch["images"].device.type, enabled=False):
+        gt_depth = batch["depths"].float()
+        if supervision_source == "batch_depth":
+            return gt_depth
+        if supervision_source != "projected_points":
+            raise ValueError(f"Unsupported depth supervision source: {supervision_source}")
+
+        required_keys = ("points", "point_mask", "extrinsics", "intrinsics")
+        missing = [key for key in required_keys if key not in batch]
+        if missing:
+            raise KeyError(
+                "Projected-point supervision requires batch keys: "
+                + ", ".join(required_keys)
+                + f"; missing {missing}"
+            )
+
+        supervise_slot_mask = (gt_depth > 0.0).flatten(2).any(-1)
+        return project_points_to_depth_targets(batch, supervise_slot_mask)
+
+
 def compute_losses(
     predictions: Dict[str, torch.Tensor],
     batch: Dict[str, torch.Tensor],
@@ -139,15 +231,18 @@ def compute_losses(
     pose_rotation_weight: float,
     pose_fov_weight: float,
     depth_pred_scale: float = 1.0,
+    depth_supervision_source: str = "batch_depth",
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    pred_depth = predictions["depth"].squeeze(-1) * depth_pred_scale
-    gt_depth = batch["depths"]
-    valid_mask = (gt_depth > 0.0) & (gt_depth < 655.0)
-    depth_loss = F.l1_loss(pred_depth[valid_mask], gt_depth[valid_mask]) if valid_mask.any() else pred_depth.new_zeros(())
+    with torch.amp.autocast(device_type=batch["images"].device.type, enabled=False):
+        pred_depth = (predictions["depth"].squeeze(-1) * depth_pred_scale).float()
+        gt_depth = build_depth_supervision_target(batch, depth_supervision_source)
+        valid_mask = (gt_depth > 0.0) & (gt_depth < 655.0)
+        depth_loss = F.l1_loss(pred_depth[valid_mask], gt_depth[valid_mask]) if valid_mask.any() else pred_depth.new_zeros(())
     total = depth_weight * depth_loss
     metrics = {
         "loss": float(total.detach().cpu()),
         "depth_loss": float(depth_loss.detach().cpu()),
+        "depth_valid_pixels": float(valid_mask.sum().detach().cpu()),
     }
 
     if "seq_enc_list" in predictions and "intrinsics" in batch and camera_weight > 0:
@@ -476,6 +571,7 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
                     pose_rotation_weight=cfg.get("pose_rotation_weight", 1.0),
                     pose_fov_weight=cfg.get("pose_fov_weight", 1.0),
                     depth_pred_scale=cfg.get("depth_pred_scale", 1.0),
+                    depth_supervision_source=cfg.get("depth_supervision_source", "batch_depth"),
                 )
 
             scaler.scale(loss).backward()
@@ -524,6 +620,7 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
                         pose_rotation_weight=cfg.get("pose_rotation_weight", 1.0),
                         pose_fov_weight=cfg.get("pose_fov_weight", 1.0),
                         depth_pred_scale=cfg.get("depth_pred_scale", 1.0),
+                        depth_supervision_source=cfg.get("depth_supervision_source", "batch_depth"),
                     )
                     for key, value in metrics.items():
                         val_sum[key] = val_sum.get(key, 0.0) + value
