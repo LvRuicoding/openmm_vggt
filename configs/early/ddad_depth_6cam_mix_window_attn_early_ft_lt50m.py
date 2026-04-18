@@ -1,8 +1,21 @@
-# mmengine-style Python config for DDAD 6-camera depth fine-tuning.
-# This follows the KITTI early-fusion setup while supervising with sparse depth
-# projected from DDAD lidar.
+# mmengine-style Python config for DDAD 6-camera depth fine-tuning (<50m only).
+#
+# This config is based on configs/early/ddad_depth_6cam_mix_window_attn_early_ft.py
+# and is intended to be used with:
+#   tools/train_ddad_depth_mix_lt50m.py
+#   tools/eval_ddad_depth_mix_lt50m.py
+#
+# These scripts restrict both training/validation loss and final evaluation
+# metrics to pixels whose GT depth is <= 50m.
 
 ddad_scene_dataset_json = "/home/dataset-local/lr/code/openmm_vggt/data/ddad/ddad_train_val/ddad.json"
+
+# ---------------------------------------------------------------------------
+# Depth range policy
+# ---------------------------------------------------------------------------
+max_gt_depth_m = 50.0
+train_max_gt_depth_m = max_gt_depth_m
+eval_max_gt_depth_m = max_gt_depth_m
 
 model = dict(
     type="mix_decoder_global_window_attn_early",
@@ -17,7 +30,7 @@ model = dict(
     voxel_size=(0.8, 0.8, 0.8),
     point_cloud_range=(-100.0, -100.0, -5.0, 100.0, 100.0, 3.0),
     serializer_grid_size_2d=14.0,
-    use_z_buffer_projection=True,
+    use_z_buffer_projection=False,
     fusion_window_size=(10, 10),
     fusion_shift_size=(5, 5),
     fusion_num_heads=16,
@@ -87,7 +100,7 @@ depth_supervision_source = "projected_points"
 depth_pred_scale = 20.0
 
 checkpoint = "/home/dataset-local/lr/code/openmm_vggt/ckpt/checkpoint_5.pt"
-output_dir = "/home/dataset-local/lr/code/openmm_vggt/trainoutput/ddad_depth_6cam_mix_window_attn_early_ft"
+output_dir = "/home/dataset-local/lr/code/openmm_vggt/trainoutput/ddad_depth_6cam_mix_window_attn_early_ft_lt50m"
 
 epochs = 4
 grad_clip = 1.0

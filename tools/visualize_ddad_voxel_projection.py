@@ -8,6 +8,8 @@ import random
 import sys
 from pathlib import Path
 
+import torch
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -24,6 +26,52 @@ from tools.visualize_voxel_projection import (
     make_contact_sheet,
     tensor_image_to_pil,
 )
+
+
+def select_camera_voxels_for_fusion(
+    bundle,
+    cam_idx: int,
+    image_hw: tuple[int, int],
+    patch_size: int,
+    use_z_buffer_projection: bool,
+):
+    uv = bundle.uv[:, cam_idx, :]
+    depth = bundle.depth[:, cam_idx]
+    visible = bundle.visible[:, cam_idx]
+    patch_x = bundle.patch_x[:, cam_idx]
+    patch_y = bundle.patch_y[:, cam_idx]
+
+    visible_idx = torch.nonzero(visible, as_tuple=False).flatten()
+    if visible_idx.numel() == 0:
+        empty_uv = uv.new_zeros((0, 2))
+        empty_depth = depth.new_zeros((0,))
+        empty_visible = torch.zeros((0,), dtype=torch.bool, device=visible.device)
+        empty_patch = torch.zeros((0,), dtype=torch.long, device=patch_x.device)
+        return empty_uv, empty_depth, empty_visible, empty_patch, empty_patch
+
+    if use_z_buffer_projection:
+        _, image_w = image_hw
+        patch_w = image_w // patch_size
+        visible_patch_idx = patch_y[visible_idx] * patch_w + patch_x[visible_idx]
+        visible_depth = depth[visible_idx]
+
+        # Match the model's z-buffer behavior: keep the nearest visible voxel per patch.
+        depth_order = torch.argsort(visible_depth, descending=False)
+        ordered_visible_idx = visible_idx[depth_order]
+        ordered_patch_idx = visible_patch_idx[depth_order]
+        keep_mask = torch.ones_like(ordered_patch_idx, dtype=torch.bool)
+        if ordered_patch_idx.numel() > 1:
+            keep_mask[1:] = ordered_patch_idx[1:] != ordered_patch_idx[:-1]
+        selected_idx = ordered_visible_idx[keep_mask]
+    else:
+        selected_idx = visible_idx
+
+    selected_uv = uv[selected_idx]
+    selected_depth = depth[selected_idx]
+    selected_patch_x = patch_x[selected_idx]
+    selected_patch_y = patch_y[selected_idx]
+    selected_visible = torch.ones((selected_idx.shape[0],), dtype=torch.bool, device=visible.device)
+    return selected_uv, selected_depth, selected_visible, selected_patch_x, selected_patch_y
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,6 +119,7 @@ def main() -> None:
         point_cloud_range=tuple(model_cfg.get("point_cloud_range", (0.0, -40.0, -3.0, 80.0, 40.0, 3.0))),
         voxel_encoder_filters=tuple(model_cfg.get("voxel_encoder_filters", (128, 128))),
     )
+    use_z_buffer_projection = bool(model_cfg.get("use_z_buffer_projection", True))
 
     sample = dataset[args.sample_index]
     sequence_name = str(sample["sequence_name"])
@@ -111,6 +160,9 @@ def main() -> None:
         f"frame_count: {frame_count}",
         f"cam_num: {cam_num}",
         f"patch_size: {projector.patch_size}",
+        f"use_z_buffer_projection: {use_z_buffer_projection}",
+        f"voxel_size: {tuple(float(x) for x in projector.voxel_size.tolist())}",
+        f"point_cloud_range: {tuple(float(x) for x in projector.point_cloud_range.tolist())}",
     ]
 
     for frame_idx in range(frame_count):
@@ -149,6 +201,15 @@ def main() -> None:
         for cam_idx in range(cam_num):
             base = tensor_image_to_pil(images[frame_idx, cam_idx])
             cam_tag = f"frame {frame_idx} cam {cam_idx}"
+            selected_uv, selected_depth, selected_visible, selected_patch_x, selected_patch_y = (
+                select_camera_voxels_for_fusion(
+                    voxel_bundle,
+                    cam_idx=cam_idx,
+                    image_hw=(image_h, image_w),
+                    patch_size=projector.patch_size,
+                    use_z_buffer_projection=use_z_buffer_projection,
+                )
+            )
             raw_panel = draw_points_overlay(
                 base.copy(),
                 raw_bundle.uv[:, cam_idx, :],
@@ -160,12 +221,12 @@ def main() -> None:
                 max_points=args.max_raw_points,
                 rng=rng,
             )
-            voxel_panel = draw_points_overlay(
+            fusion_panel = draw_points_overlay(
                 base.copy(),
-                voxel_bundle.uv[:, cam_idx, :],
-                voxel_bundle.visible[:, cam_idx],
-                voxel_bundle.depth[:, cam_idx],
-                title=f"{cam_tag} | voxel centers",
+                selected_uv,
+                selected_visible,
+                selected_depth,
+                title=f"{cam_tag} | fusion voxels",
                 point_radius=args.point_radius,
                 color=(255, 80, 80),
                 max_points=args.max_voxel_points,
@@ -173,13 +234,19 @@ def main() -> None:
             )
             patch_panel = draw_patch_heatmap(
                 base.copy(),
-                voxel_bundle.patch_x[:, cam_idx],
-                voxel_bundle.patch_y[:, cam_idx],
-                voxel_bundle.visible[:, cam_idx],
+                selected_patch_x,
+                selected_patch_y,
+                selected_visible,
                 patch_size=projector.patch_size,
-                title=f"{cam_tag} | patch bins",
+                title=f"{cam_tag} | fusion patch bins",
             )
-            triptych = concat_h([raw_panel, voxel_panel, patch_panel])
+            summary_lines.append(
+                f"frame {frame_idx} cam {cam_idx}: "
+                f"raw_visible={int(raw_bundle.visible[:, cam_idx].sum().item())} "
+                f"voxel_visible={int(voxel_bundle.visible[:, cam_idx].sum().item())} "
+                f"fusion_selected={int(selected_visible.sum().item())}"
+            )
+            triptych = concat_h([raw_panel, fusion_panel, patch_panel])
             row_images.append(triptych)
             triptych.save(output_dir / f"frame_{frame_idx:02d}_cam_{cam_idx:02d}.png")
 
