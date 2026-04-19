@@ -15,7 +15,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mmengine.config import Config
-from mmengine.registry import DATASETS
+from mmengine.registry import DATASETS, MODELS
 
 import openmm_vggt  # noqa: F401
 from tools.visualize_voxel_projection import (
@@ -33,7 +33,8 @@ def select_camera_voxels_for_fusion(
     cam_idx: int,
     image_hw: tuple[int, int],
     patch_size: int,
-    use_z_buffer_projection: bool,
+    use_top_k: bool,
+    top_k_per_patch: int,
 ):
     uv = bundle.uv[:, cam_idx, :]
     depth = bundle.depth[:, cam_idx]
@@ -49,20 +50,34 @@ def select_camera_voxels_for_fusion(
         empty_patch = torch.zeros((0,), dtype=torch.long, device=patch_x.device)
         return empty_uv, empty_depth, empty_visible, empty_patch, empty_patch
 
-    if use_z_buffer_projection:
+    if use_top_k:
         _, image_w = image_hw
         patch_w = image_w // patch_size
         visible_patch_idx = patch_y[visible_idx] * patch_w + patch_x[visible_idx]
         visible_depth = depth[visible_idx]
 
-        # Match the model's z-buffer behavior: keep the nearest visible voxel per patch.
+        # Match the model's top-k behavior: keep the nearest visible voxels per patch.
         depth_order = torch.argsort(visible_depth, descending=False)
         ordered_visible_idx = visible_idx[depth_order]
         ordered_patch_idx = visible_patch_idx[depth_order]
-        keep_mask = torch.ones_like(ordered_patch_idx, dtype=torch.bool)
-        if ordered_patch_idx.numel() > 1:
-            keep_mask[1:] = ordered_patch_idx[1:] != ordered_patch_idx[:-1]
-        selected_idx = ordered_visible_idx[keep_mask]
+        if ordered_patch_idx.numel() == 0:
+            selected_idx = ordered_visible_idx
+        else:
+            new_group = torch.ones_like(ordered_patch_idx, dtype=torch.bool)
+            if ordered_patch_idx.numel() > 1:
+                new_group[1:] = ordered_patch_idx[1:] != ordered_patch_idx[:-1]
+            group_ids = torch.cumsum(new_group.to(torch.long), dim=0) - 1
+            group_start = torch.full(
+                (int(group_ids[-1].item()) + 1,),
+                ordered_patch_idx.shape[0],
+                device=ordered_patch_idx.device,
+                dtype=torch.long,
+            )
+            sorted_pos = torch.arange(ordered_patch_idx.shape[0], device=ordered_patch_idx.device, dtype=torch.long)
+            group_start.scatter_reduce_(0, group_ids, sorted_pos, reduce="amin", include_self=True)
+            rank_in_group = sorted_pos - group_start[group_ids]
+            keep_mask = rank_in_group < max(int(top_k_per_patch), 1)
+            selected_idx = ordered_visible_idx[keep_mask]
     else:
         selected_idx = visible_idx
 
@@ -112,14 +127,11 @@ def main() -> None:
     if args.sample_index < 0 or args.sample_index >= len(dataset):
         raise IndexError(f"sample-index {args.sample_index} out of range [0, {len(dataset) - 1}]")
 
-    model_cfg = cfg.model
-    projector = FusionProjector(
-        patch_size=int(model_cfg.get("patch_size", 14)),
-        voxel_size=tuple(model_cfg.get("voxel_size", (0.4, 0.4, 0.8))),
-        point_cloud_range=tuple(model_cfg.get("point_cloud_range", (0.0, -40.0, -3.0, 80.0, 40.0, 3.0))),
-        voxel_encoder_filters=tuple(model_cfg.get("voxel_encoder_filters", (128, 128))),
-    )
-    use_z_buffer_projection = bool(model_cfg.get("use_z_buffer_projection", True))
+    model_cfg = copy.deepcopy(cfg.model)
+    model = MODELS.build(model_cfg)
+    projector = FusionProjector.from_model(model)
+    use_top_k = bool(model.use_top_k)
+    top_k_per_patch = int(model.top_k_per_patch)
 
     sample = dataset[args.sample_index]
     sequence_name = str(sample["sequence_name"])
@@ -134,7 +146,7 @@ def main() -> None:
     point_mask = sample["point_mask"]
 
     sequence_length, _, image_h, image_w = images.shape
-    cam_num = int(model_cfg.get("cam_num", 6))
+    cam_num = int(model.cam_num)
     frame_count = points.shape[0]
     if sequence_length != frame_count * cam_num:
         raise ValueError(
@@ -160,7 +172,8 @@ def main() -> None:
         f"frame_count: {frame_count}",
         f"cam_num: {cam_num}",
         f"patch_size: {projector.patch_size}",
-        f"use_z_buffer_projection: {use_z_buffer_projection}",
+        f"use_top_k: {use_top_k}",
+        f"top_k_per_patch: {top_k_per_patch}",
         f"voxel_size: {tuple(float(x) for x in projector.voxel_size.tolist())}",
         f"point_cloud_range: {tuple(float(x) for x in projector.point_cloud_range.tolist())}",
     ]
@@ -207,7 +220,8 @@ def main() -> None:
                     cam_idx=cam_idx,
                     image_hw=(image_h, image_w),
                     patch_size=projector.patch_size,
-                    use_z_buffer_projection=use_z_buffer_projection,
+                    use_top_k=use_top_k,
+                    top_k_per_patch=top_k_per_patch,
                 )
             )
             raw_panel = draw_points_overlay(
@@ -226,11 +240,12 @@ def main() -> None:
                 selected_uv,
                 selected_visible,
                 selected_depth,
-                title=f"{cam_tag} | fusion voxels",
+                title=f"{cam_tag} | fusion voxels depth-shaded",
                 point_radius=args.point_radius,
-                color=(255, 80, 80),
+                color=(0, 190, 255),
                 max_points=args.max_voxel_points,
                 rng=rng,
+                depth_shaded=True,
             )
             patch_panel = draw_patch_heatmap(
                 base.copy(),

@@ -38,7 +38,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mmengine.config import Config
-from mmengine.registry import DATASETS
+from mmengine.registry import DATASETS, MODELS
 
 import openmm_vggt  # noqa: F401
 from openmm_vggt.models.pcdet_dynamic_voxel_vfe import PCDetDynamicVoxelVFE
@@ -61,25 +61,42 @@ class FusionProjector:
         patch_size: int,
         voxel_size: tuple[float, float, float],
         point_cloud_range: tuple[float, float, float, float, float, float],
-        voxel_encoder_filters: tuple[int, ...],
+        voxel_encoder_filters: tuple[int, ...] | None = None,
+        voxel_encoder: PCDetDynamicVoxelVFE | None = None,
     ) -> None:
         self.patch_size = patch_size
         self.voxel_size = torch.tensor(voxel_size, dtype=torch.float32)
         self.point_cloud_range = torch.tensor(point_cloud_range, dtype=torch.float32)
-        grid_size = [
-            int((point_cloud_range[3] - point_cloud_range[0]) / voxel_size[0]),
-            int((point_cloud_range[4] - point_cloud_range[1]) / voxel_size[1]),
-            int((point_cloud_range[5] - point_cloud_range[2]) / voxel_size[2]),
-        ]
-        self.voxel_encoder = PCDetDynamicVoxelVFE(
-            num_point_features=4,
+        if voxel_encoder is not None:
+            self.voxel_encoder = voxel_encoder
+        else:
+            if voxel_encoder_filters is None:
+                raise ValueError("voxel_encoder_filters must be provided when voxel_encoder is not supplied")
+            grid_size = [
+                int((point_cloud_range[3] - point_cloud_range[0]) / voxel_size[0]),
+                int((point_cloud_range[4] - point_cloud_range[1]) / voxel_size[1]),
+                int((point_cloud_range[5] - point_cloud_range[2]) / voxel_size[2]),
+            ]
+            self.voxel_encoder = PCDetDynamicVoxelVFE(
+                num_point_features=4,
+                voxel_size=voxel_size,
+                grid_size=grid_size,
+                point_cloud_range=point_cloud_range,
+                use_norm=True,
+                with_distance=False,
+                use_absolute_xyz=True,
+                num_filters=voxel_encoder_filters,
+            )
+
+    @classmethod
+    def from_model(cls, model: torch.nn.Module) -> "FusionProjector":
+        voxel_size = tuple(float(x) for x in model.fusion_voxel_size.tolist())
+        point_cloud_range = tuple(float(x) for x in model.fusion_point_cloud_range.tolist())
+        return cls(
+            patch_size=int(model.patch_size),
             voxel_size=voxel_size,
-            grid_size=grid_size,
             point_cloud_range=point_cloud_range,
-            use_norm=True,
-            with_distance=False,
-            use_absolute_xyz=True,
-            num_filters=voxel_encoder_filters,
+            voxel_encoder=model.voxel_encoder,
         )
 
     def world_points_to_local(
@@ -215,13 +232,14 @@ def draw_points_overlay(
     color: tuple[int, int, int],
     max_points: int,
     rng: random.Random,
+    depth_shaded: bool = False,
 ) -> Image.Image:
     canvas = image.convert("RGBA")
     overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay, "RGBA")
-    visible_indices = torch.nonzero(visible, as_tuple=False).flatten().tolist()
-    visible_indices = sample_indices(len(visible_indices), max_points, rng)
-    selected = [torch.nonzero(visible, as_tuple=False).flatten().tolist()[idx] for idx in visible_indices]
+    visible_points = torch.nonzero(visible, as_tuple=False).flatten().tolist()
+    sampled_positions = sample_indices(len(visible_points), max_points, rng)
+    selected = [visible_points[idx] for idx in sampled_positions]
 
     if selected:
         depth_values = depth[selected]
@@ -231,28 +249,47 @@ def draw_points_overlay(
         depth_min = 0.0
         depth_max = 1.0
 
+    if depth_shaded:
+        selected = sorted(selected, key=lambda idx: float(depth[idx]), reverse=True)
+
     for idx in selected:
         x = float(uv[idx, 0])
         y = float(uv[idx, 1])
         alpha = 210
+        point_color = color
         if depth_max > depth_min:
             norm = (float(depth[idx]) - depth_min) / (depth_max - depth_min)
-            alpha = int(120 + 120 * (1.0 - norm))
+            alpha = int(180 + 75 * (1.0 - norm))
+            if depth_shaded:
+                contrast_norm = norm ** 0.75
+                gray_value = int(245 * (1.0 - contrast_norm) + 20 * contrast_norm)
+                point_color = (gray_value, gray_value, gray_value)
+        elif depth_shaded:
+            point_color = (245, 245, 245)
+        if depth_shaded:
+            outer_radius = point_radius + 1
+            outline_gray = 10 if point_color[0] >= 128 else 245
+            draw.ellipse(
+                (x - outer_radius, y - outer_radius, x + outer_radius, y + outer_radius),
+                fill=(outline_gray, outline_gray, outline_gray, min(alpha + 20, 255)),
+                outline=None,
+            )
         draw.ellipse(
             (x - point_radius, y - point_radius, x + point_radius, y + point_radius),
-            fill=(color[0], color[1], color[2], alpha),
+            fill=(point_color[0], point_color[1], point_color[2], alpha),
             outline=None,
         )
 
     blended = Image.alpha_composite(canvas, overlay).convert("RGB")
-    annotate_image(
-        blended,
-        [
-            title,
-            f"visible: {int(visible.sum().item())}",
-            f"drawn: {len(selected)}",
-        ],
-    )
+    annotation_lines = [
+        title,
+        f"visible: {int(visible.sum().item())}",
+        f"drawn: {len(selected)}",
+    ]
+    if depth_shaded and selected:
+        annotation_lines.append(f"depth: {depth_min:.2f}m-{depth_max:.2f}m")
+        annotation_lines.append("grayscale: near white -> far black")
+    annotate_image(blended, annotation_lines)
     return blended
 
 
@@ -366,13 +403,9 @@ def main() -> None:
     if args.sample_index < 0 or args.sample_index >= len(dataset):
         raise IndexError(f"sample-index {args.sample_index} out of range [0, {len(dataset) - 1}]")
 
-    model_cfg = cfg.model
-    projector = FusionProjector(
-        patch_size=int(model_cfg.get("patch_size", 14)),
-        voxel_size=tuple(model_cfg.get("voxel_size", (0.4, 0.4, 0.8))),
-        point_cloud_range=tuple(model_cfg.get("point_cloud_range", (0.0, -40.0, -3.0, 80.0, 40.0, 3.0))),
-        voxel_encoder_filters=tuple(model_cfg.get("voxel_encoder_filters", (128, 128))),
-    )
+    model_cfg = copy.deepcopy(cfg.model)
+    model = MODELS.build(model_cfg)
+    projector = FusionProjector.from_model(model)
 
     sample = dataset[args.sample_index]
     sequence_name = sample["sequence_name"]
@@ -387,7 +420,7 @@ def main() -> None:
     point_mask = sample["point_mask"]
 
     sequence_length, _, image_h, image_w = images.shape
-    cam_num = int(model_cfg.get("cam_num", 2))
+    cam_num = int(model.cam_num)
     frame_count = points.shape[0]
     if sequence_length != frame_count * cam_num:
         raise ValueError(

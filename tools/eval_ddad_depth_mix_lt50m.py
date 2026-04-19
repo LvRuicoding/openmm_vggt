@@ -30,7 +30,7 @@ ACTIVE_MAX_GT_DEPTH_M = DEFAULT_MAX_GT_DEPTH_M
 
 class DepthMetricsLT50M(base_eval.DepthMetrics):
     def update(self, pred_m, gt_m) -> None:
-        mask = (gt_m > 0.0) & (gt_m <= ACTIVE_MAX_GT_DEPTH_M)
+        mask = (gt_m > 0.0) & (gt_m < 655.0) & (gt_m <= ACTIVE_MAX_GT_DEPTH_M)
         if not mask.any():
             return
         pred = pred_m[mask].clamp_min(1e-6).double()
@@ -84,7 +84,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         choices=("batch_depth", "projected_points"),
-        help="Override GT depth construction. If not set, reads config.",
+        help="Override GT depth construction. If not set, defaults to batch_depth for DDAD evaluation.",
     )
     parser.add_argument(
         "--max-gt-depth-m",
@@ -195,11 +195,7 @@ def main() -> None:
         )
 
         depth_scale = args.depth_scale if args.depth_scale is not None else float(cfg.get("depth_pred_scale", 1.0))
-        supervision_source = (
-            args.supervision_source
-            if args.supervision_source is not None
-            else str(cfg.get("depth_supervision_source", "batch_depth"))
-        )
+        supervision_source = args.supervision_source if args.supervision_source is not None else "batch_depth"
 
         base_eval.DepthMetrics = DepthMetricsLT50M
 
@@ -243,6 +239,7 @@ def main() -> None:
             device,
             depth_scale=depth_scale,
             supervision_source=supervision_source,
+            amp_enabled=bool(cfg.get("amp", True)),
         )
         metrics = metrics.result()
 

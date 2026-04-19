@@ -136,7 +136,7 @@ class DepthMetrics:
         self.d3 = 0.0
 
     def update(self, pred_m: torch.Tensor, gt_m: torch.Tensor) -> None:
-        mask = gt_m > 0.0
+        mask = (gt_m > 0.0) & (gt_m < 655.0)
         if not mask.any():
             return
         pred = pred_m[mask].clamp_min(1e-6).double()
@@ -436,6 +436,7 @@ def evaluate(
     device: torch.device,
     depth_scale: float,
     supervision_source: str,
+    amp_enabled: bool,
 ) -> Tuple[DepthMetrics, int]:
     local = DepthMetrics()
     evaluated_cameras = 0
@@ -455,7 +456,7 @@ def evaluate(
             imgs = model_batch["images"]
             norm_ext = normalize_extrinsics_to_first_frame(model_batch["extrinsics"])
 
-            with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled and device.type == "cuda"):
                 preds = model(
                     imgs,
                     others={
@@ -520,7 +521,7 @@ def parse_args(
         type=str,
         default=None,
         choices=("batch_depth", "projected_points"),
-        help="Override GT depth construction. If not set, reads depth_supervision_source from config.",
+        help="Override GT depth construction. If not set, defaults to batch_depth for DDAD evaluation.",
     )
     return parser.parse_args()
 
@@ -557,11 +558,7 @@ def main(
         )
 
         depth_scale = args.depth_scale if args.depth_scale is not None else float(cfg.get("depth_pred_scale", 1.0))
-        supervision_source = (
-            args.supervision_source
-            if args.supervision_source is not None
-            else str(cfg.get("depth_supervision_source", "batch_depth"))
-        )
+        supervision_source = args.supervision_source if args.supervision_source is not None else "batch_depth"
 
         model = MODELS.build(cfg.model)
         checkpoint_include_prefixes = tuple(cfg.get("checkpoint_include_prefixes", ()))
@@ -602,6 +599,7 @@ def main(
             device,
             depth_scale=depth_scale,
             supervision_source=supervision_source,
+            amp_enabled=bool(cfg.get("amp", True)),
         )
         metrics = metrics.result()
 

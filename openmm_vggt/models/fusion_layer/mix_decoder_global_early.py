@@ -22,7 +22,8 @@ class mix_decoder_global_early(_MixDecoderGlobalBase):
         point_cloud_range=(0.0, -40.0, -3.0, 80.0, 40.0, 3.0),
         voxel_encoder_filters=(128, 128),
         serializer_grid_size_2d=14.0,
-        use_z_buffer_projection=True,
+        use_top_k=True,
+        top_k_per_patch=1,
     ):
         super().__init__(
             img_size=img_size,
@@ -37,7 +38,8 @@ class mix_decoder_global_early(_MixDecoderGlobalBase):
             point_cloud_range=point_cloud_range,
             voxel_encoder_filters=voxel_encoder_filters,
             serializer_grid_size_2d=serializer_grid_size_2d,
-            use_z_buffer_projection=use_z_buffer_projection,
+            use_top_k=use_top_k,
+            top_k_per_patch=top_k_per_patch,
         )
         self.aggregator = EarlyFusionAggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
         self.early_voxel_feature_proj = nn.Linear(self.voxel_encoder.get_output_feature_dim(), embed_dim)

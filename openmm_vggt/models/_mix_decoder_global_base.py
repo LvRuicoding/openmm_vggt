@@ -1,3 +1,4 @@
+import math
 from typing import List
 
 import torch
@@ -34,6 +35,50 @@ class SimplePatchFusion(nn.Module):
         voxel_features = self.voxel_proj(voxel_features)
         gate = self.gate(torch.cat([patch_tokens, voxel_features], dim=-1))
         return patch_tokens + gate * voxel_features
+
+
+class VoxelPositionEncoder3D(nn.Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        point_cloud_range,
+        omega_0: float = 100.0,
+    ):
+        super().__init__()
+        coord_embed_dim = max(2, int(math.ceil(embed_dim / 6.0)) * 2)
+        self.coord_embed_dim = coord_embed_dim
+        self.omega_0 = float(omega_0)
+        point_cloud_range = torch.tensor(point_cloud_range, dtype=torch.float32)
+        self.register_buffer("coord_min", point_cloud_range[:3], persistent=False)
+        self.register_buffer("coord_span", point_cloud_range[3:] - point_cloud_range[:3], persistent=False)
+        self.proj = nn.Sequential(
+            nn.LayerNorm(3 + coord_embed_dim * 3),
+            nn.Linear(3 + coord_embed_dim * 3, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+    def _make_sincos_pos_embed(self, pos: torch.Tensor) -> torch.Tensor:
+        omega = torch.arange(
+            self.coord_embed_dim // 2,
+            dtype=torch.float32 if pos.device.type == "mps" else torch.double,
+            device=pos.device,
+        )
+        omega /= self.coord_embed_dim / 2.0
+        omega = 1.0 / self.omega_0**omega
+        out = torch.einsum("m,d->md", pos.reshape(-1), omega)
+        return torch.cat([torch.sin(out), torch.cos(out)], dim=1).float()
+
+    def forward(self, voxel_xyz: torch.Tensor) -> torch.Tensor:
+        coord_span = torch.clamp(self.coord_span.to(device=voxel_xyz.device, dtype=voxel_xyz.dtype), min=1e-6)
+        coord_min = self.coord_min.to(device=voxel_xyz.device, dtype=voxel_xyz.dtype)
+        normalized_xyz = ((voxel_xyz - coord_min) / coord_span) * 2.0 - 1.0
+        xyz_embed = torch.cat(
+            [self._make_sincos_pos_embed(normalized_xyz[:, axis]) for axis in range(3)],
+            dim=-1,
+        )
+        xyz_features = torch.cat([normalized_xyz, xyz_embed.to(normalized_xyz.dtype)], dim=-1)
+        return self.proj(xyz_features)
 
 
 def replace_patch_tokens(
@@ -75,7 +120,8 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
         point_cloud_range=(0.0, -40.0, -3.0, 80.0, 40.0, 3.0),
         voxel_encoder_filters=(128, 128),
         serializer_grid_size_2d=14.0,
-        use_z_buffer_projection=True,
+        use_top_k=True,
+        top_k_per_patch=1,
     ):
         super().__init__()
         self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
@@ -87,7 +133,8 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
 
         self.cam_num = cam_num
         self.patch_size = patch_size
-        self.use_z_buffer_projection = bool(use_z_buffer_projection)
+        self.use_top_k = bool(use_top_k)
+        self.top_k_per_patch = max(int(top_k_per_patch), 1)
         self.rel_pose_embed = nn.Linear(7, 2048)
         self.intri_embed = nn.Linear(4, 2048)
         self.pose_intri_fuse = nn.Linear(4096, 2048)
@@ -343,7 +390,7 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
     def _project_early_voxel_features(self, voxel_features: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError("Early fusion models must implement `_project_early_voxel_features`.")
 
-    def _select_z_buffer_projected_voxels(
+    def _select_top_k_projected_voxels(
         self,
         voxel_batch_ids: torch.Tensor,
         patch_y: torch.Tensor,
@@ -402,35 +449,49 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
         valid_batch_frame_ids = flat_batch_frame_ids[flat_visible]
         valid_cam_ids = flat_cam_ids[flat_visible]
 
-        min_depth = torch.full(
-            (flat_output_size,),
-            torch.finfo(valid_depth.dtype).max,
-            device=valid_depth.device,
-            dtype=valid_depth.dtype,
-        )
-        min_depth.scatter_reduce_(0, valid_output_index, valid_depth, reduce="amin", include_self=True)
+        topk = max(int(self.top_k_per_patch), 1)
+        if valid_output_index.numel() == 0:
+            return {
+                "selected_valid_positions": empty_long,
+                "selected_output_indices": empty_long,
+                "flat_seq_ids": empty_long,
+                "patch_idx": empty_long,
+                "patch_y": empty_long,
+                "patch_x": empty_long,
+                "coord_batch_frame_ids": empty_long,
+                "coord_cam_ids": empty_long,
+                "depth": empty_depth,
+                "flat_output_size": flat_output_size,
+            }
 
-        nearest_mask = valid_depth <= (min_depth[valid_output_index] + 1e-6)
-        nearest_positions = torch.nonzero(nearest_mask, as_tuple=False).squeeze(-1)
-        nearest_output_index = valid_output_index[nearest_positions]
+        # Stable lexicographic sort by (output_index, depth) so the first `topk`
+        # entries in each group are the nearest visible voxels for that patch.
+        depth_order = torch.argsort(valid_depth, stable=True)
+        output_sorted_by_depth = valid_output_index[depth_order]
+        output_order = torch.argsort(output_sorted_by_depth, stable=True)
+        sorted_valid_positions = depth_order[output_order]
+        sorted_output_index = valid_output_index[sorted_valid_positions]
 
-        first_position = torch.full(
-            (flat_output_size,),
-            nearest_positions.shape[0],
+        sorted_count = sorted_output_index.shape[0]
+        sorted_pos = torch.arange(sorted_count, device=valid_output_index.device, dtype=torch.long)
+        new_group = torch.ones((sorted_count,), dtype=torch.bool, device=valid_output_index.device)
+        if sorted_count > 1:
+            new_group[1:] = sorted_output_index[1:] != sorted_output_index[:-1]
+        group_ids = torch.cumsum(new_group.to(torch.long), dim=0) - 1
+        group_count = int(group_ids[-1].item()) + 1
+
+        group_start = torch.full(
+            (group_count,),
+            sorted_count,
             device=valid_output_index.device,
             dtype=torch.long,
         )
-        first_position.scatter_reduce_(
-            0,
-            nearest_output_index,
-            nearest_positions,
-            reduce="amin",
-            include_self=True,
-        )
+        group_start.scatter_reduce_(0, group_ids, sorted_pos, reduce="amin", include_self=True)
+        rank_in_group = sorted_pos - group_start[group_ids]
+        keep_mask = rank_in_group < topk
 
-        selected_output_mask = first_position < nearest_positions.shape[0]
-        selected_output_indices = torch.nonzero(selected_output_mask, as_tuple=False).squeeze(-1)
-        selected_valid_positions = first_position[selected_output_mask]
+        selected_valid_positions = sorted_valid_positions[keep_mask]
+        selected_output_indices = sorted_output_index[keep_mask]
 
         batch_frame_ids = selected_output_indices // (self.cam_num * patch_count)
         rem = selected_output_indices % (self.cam_num * patch_count)
@@ -465,8 +526,8 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
         patch_w: int,
         patch_count: int,
     ) -> dict:
-        if self.use_z_buffer_projection:
-            return self._select_z_buffer_projected_voxels(
+        if self.use_top_k:
+            return self._select_top_k_projected_voxels(
                 voxel_batch_ids=voxel_batch_ids,
                 patch_y=patch_y,
                 patch_x=patch_x,
@@ -543,6 +604,7 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
 
         empty_long = torch.zeros((0,), dtype=torch.long, device=points.device)
         empty_float = points.new_zeros((0,))
+        empty_xyz = points.new_zeros((0, 3))
         empty_voxel_tokens = voxel_tokens.new_zeros((0, channels))
         dense_patch_voxel_tokens = voxel_tokens.new_zeros((flat_seq_count, patch_count, channels))
         if voxel_tokens.shape[0] == 0:
@@ -555,14 +617,16 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
                 "coord_y": empty_float,
                 "coord_x": empty_float,
                 "depth": empty_float,
+                "coord_xyz": empty_xyz,
                 "patch_h": patch_h,
                 "patch_w": patch_w,
                 "patch_count": patch_count,
                 "dense_patch_voxel_tokens": dense_patch_voxel_tokens,
             }
 
-        voxel_centers = self._voxel_coords_to_centers(voxel_coords)
+        voxel_centers_local = self._voxel_coords_to_centers(voxel_coords)
         voxel_batch_ids = voxel_coords[:, 0].long()
+        voxel_centers = voxel_centers_local
         if lidar_to_world is not None:
             voxel_centers = self._local_voxel_centers_to_world(voxel_centers, voxel_batch_ids, lidar_to_world)
 
@@ -603,6 +667,7 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
                 "coord_y": empty_float,
                 "coord_x": empty_float,
                 "depth": empty_float,
+                "coord_xyz": empty_xyz,
                 "patch_h": patch_h,
                 "patch_w": patch_w,
                 "patch_count": patch_count,
@@ -614,16 +679,19 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
         flat_v = v.reshape(-1)
         flat_depth = depth.reshape(-1)
         flat_visible = visible.reshape(-1)
+        flat_voxel_xyz = voxel_centers_local.unsqueeze(1).expand(-1, self.cam_num, -1).reshape(-1, 3)
 
         valid_voxel_tokens = flat_voxel_tokens[flat_visible]
         valid_u = flat_u[flat_visible]
         valid_v = flat_v[flat_visible]
         valid_depth = flat_depth[flat_visible]
+        valid_voxel_xyz = flat_voxel_xyz[flat_visible]
 
         selected_voxel_tokens = valid_voxel_tokens[selected_valid_positions]
         selected_coord_x = valid_u[selected_valid_positions]
         selected_coord_y = valid_v[selected_valid_positions]
         selected_depth = valid_depth[selected_valid_positions]
+        selected_coord_xyz = valid_voxel_xyz[selected_valid_positions]
         dense_patch_voxel_tokens = self._scatter_projected_tokens_to_dense_grid(
             projected_tokens=selected_voxel_tokens,
             flat_seq_ids=projection_selection["flat_seq_ids"],
@@ -641,6 +709,7 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
             "coord_y": selected_coord_y,
             "coord_x": selected_coord_x,
             "depth": selected_depth,
+            "coord_xyz": selected_coord_xyz,
             "patch_h": patch_h,
             "patch_w": patch_w,
             "patch_count": patch_count,

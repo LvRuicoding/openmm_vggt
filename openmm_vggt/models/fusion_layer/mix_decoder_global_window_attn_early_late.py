@@ -5,7 +5,7 @@ import torch.nn as nn
 from mmengine.registry import MODELS
 
 from ..aggregator_window_attn_early import EarlyFusionAggregator
-from .._mix_decoder_global_base import _MixDecoderGlobalBase
+from .._mix_decoder_global_base import VoxelPositionEncoder3D, _MixDecoderGlobalBase
 from ..window_attn_fusion import ShiftWindowPatchVoxelCrossFusion
 
 
@@ -25,7 +25,8 @@ class mix_decoder_global_window_attn_early_late(_MixDecoderGlobalBase):
         point_cloud_range=(0.0, -40.0, -3.0, 80.0, 40.0, 3.0),
         voxel_encoder_filters=(128, 128),
         serializer_grid_size_2d=14.0,
-        use_z_buffer_projection=True,
+        use_top_k=True,
+        top_k_per_patch=1,
         fusion_window_size: Tuple[int, int] = (10, 10),
         fusion_shift_size: Tuple[int, int] | None = None,
         fusion_window_stride: Tuple[int, int] | None = None,
@@ -46,17 +47,17 @@ class mix_decoder_global_window_attn_early_late(_MixDecoderGlobalBase):
             point_cloud_range=point_cloud_range,
             voxel_encoder_filters=voxel_encoder_filters,
             serializer_grid_size_2d=serializer_grid_size_2d,
-            use_z_buffer_projection=use_z_buffer_projection,
+            use_top_k=use_top_k,
+            top_k_per_patch=top_k_per_patch,
         )
         self.aggregator = EarlyFusionAggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
         if fusion_shift_size is None:
             fusion_shift_size = fusion_window_stride
 
         self.early_voxel_feature_proj = nn.Linear(self.voxel_encoder.get_output_feature_dim(), embed_dim)
-        self.early_voxel_geometry_proj = nn.Sequential(
-            nn.Linear(3, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
+        self.early_voxel_geometry_proj = VoxelPositionEncoder3D(
+            embed_dim=embed_dim,
+            point_cloud_range=point_cloud_range,
         )
         self.early_window_fusion = ShiftWindowPatchVoxelCrossFusion(
             embed_dim=embed_dim,
@@ -69,10 +70,9 @@ class mix_decoder_global_window_attn_early_late(_MixDecoderGlobalBase):
 
         late_embed_dim = embed_dim * 2
         self.final_layer_voxel_feature_proj = nn.Linear(self.voxel_encoder.get_output_feature_dim(), late_embed_dim)
-        self.final_layer_voxel_geometry_proj = nn.Sequential(
-            nn.Linear(3, late_embed_dim),
-            nn.GELU(),
-            nn.Linear(late_embed_dim, late_embed_dim),
+        self.final_layer_voxel_geometry_proj = VoxelPositionEncoder3D(
+            embed_dim=late_embed_dim,
+            point_cloud_range=point_cloud_range,
         )
         self.final_layer_window_fusion = ShiftWindowPatchVoxelCrossFusion(
             embed_dim=late_embed_dim,
@@ -143,17 +143,8 @@ class mix_decoder_global_window_attn_early_late(_MixDecoderGlobalBase):
         if voxel_tokens.shape[0] == 0:
             return patch_tokens
 
-        image_h, image_w = image_hw
-        depth_scale = torch.clamp(self.fusion_point_cloud_range[3] - self.fusion_point_cloud_range[0], min=1.0)
-        voxel_geometry = torch.stack(
-            [
-                fusion_inputs["coord_x"] / max(float(image_w), 1.0),
-                fusion_inputs["coord_y"] / max(float(image_h), 1.0),
-                fusion_inputs["depth"] / depth_scale.to(fusion_inputs["depth"].dtype),
-            ],
-            dim=-1,
-        ).to(voxel_tokens.dtype)
-        voxel_tokens = voxel_tokens + voxel_geometry_proj(voxel_geometry)
+        voxel_xyz = fusion_inputs["coord_xyz"].to(voxel_tokens.dtype)
+        voxel_tokens = voxel_tokens + voxel_geometry_proj(voxel_xyz)
 
         flat_seq_ids = fusion_inputs["flat_seq_ids"]
         patch_y = fusion_inputs["patch_y"]
