@@ -628,7 +628,7 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
         voxel_batch_ids = voxel_coords[:, 0].long()
         voxel_centers = voxel_centers_local
         if lidar_to_world is not None:
-            voxel_centers = self._local_voxel_centers_to_world(voxel_centers, voxel_batch_ids, lidar_to_world)
+            voxel_centers = self._local_voxel_centers_to_world(voxel_centers_local, voxel_batch_ids, lidar_to_world)
 
         u, v, depth = self._project_voxels_to_image_coords(
             voxel_centers,

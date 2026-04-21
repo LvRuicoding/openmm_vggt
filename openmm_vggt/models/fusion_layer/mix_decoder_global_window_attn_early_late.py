@@ -57,7 +57,7 @@ class mix_decoder_global_window_attn_early_late(_MixDecoderGlobalBase):
         self.early_voxel_feature_proj = nn.Linear(self.voxel_encoder.get_output_feature_dim(), embed_dim)
         self.early_voxel_geometry_proj = VoxelPositionEncoder3D(
             embed_dim=embed_dim,
-            point_cloud_range=point_cloud_range,
+            point_cloud_range=self.fusion_point_cloud_range.cpu().tolist(),
         )
         self.early_window_fusion = ShiftWindowPatchVoxelCrossFusion(
             embed_dim=embed_dim,
@@ -72,7 +72,7 @@ class mix_decoder_global_window_attn_early_late(_MixDecoderGlobalBase):
         self.final_layer_voxel_feature_proj = nn.Linear(self.voxel_encoder.get_output_feature_dim(), late_embed_dim)
         self.final_layer_voxel_geometry_proj = VoxelPositionEncoder3D(
             embed_dim=late_embed_dim,
-            point_cloud_range=point_cloud_range,
+            point_cloud_range=self.fusion_point_cloud_range.cpu().tolist(),
         )
         self.final_layer_window_fusion = ShiftWindowPatchVoxelCrossFusion(
             embed_dim=late_embed_dim,

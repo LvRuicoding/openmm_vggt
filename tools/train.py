@@ -232,12 +232,23 @@ def compute_losses(
     pose_fov_weight: float,
     depth_pred_scale: float = 1.0,
     depth_supervision_source: str = "batch_depth",
+    depth_loss_type: str = "l1",
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     with torch.amp.autocast(device_type=batch["images"].device.type, enabled=False):
         pred_depth = (predictions["depth"].squeeze(-1) * depth_pred_scale).float()
         gt_depth = build_depth_supervision_target(batch, depth_supervision_source)
         valid_mask = (gt_depth > 0.0) & (gt_depth < 655.0)
-        depth_loss = F.l1_loss(pred_depth[valid_mask], gt_depth[valid_mask]) if valid_mask.any() else pred_depth.new_zeros(())
+        if valid_mask.any():
+            valid_pred_depth = pred_depth[valid_mask]
+            valid_gt_depth = gt_depth[valid_mask]
+            if depth_loss_type == "l1":
+                depth_loss = F.l1_loss(valid_pred_depth, valid_gt_depth)
+            elif depth_loss_type == "log1p_l1":
+                depth_loss = F.l1_loss(torch.log1p(valid_pred_depth), torch.log1p(valid_gt_depth))
+            else:
+                raise ValueError(f"Unsupported depth_loss_type: {depth_loss_type}")
+        else:
+            depth_loss = pred_depth.new_zeros(())
     total = depth_weight * depth_loss
     metrics = {
         "loss": float(total.detach().cpu()),
@@ -572,6 +583,7 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
                     pose_fov_weight=cfg.get("pose_fov_weight", 1.0),
                     depth_pred_scale=cfg.get("depth_pred_scale", 1.0),
                     depth_supervision_source=cfg.get("depth_supervision_source", "batch_depth"),
+                    depth_loss_type=cfg.get("depth_loss_type", "l1"),
                 )
 
             scaler.scale(loss).backward()
@@ -621,6 +633,7 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
                         pose_fov_weight=cfg.get("pose_fov_weight", 1.0),
                         depth_pred_scale=cfg.get("depth_pred_scale", 1.0),
                         depth_supervision_source=cfg.get("depth_supervision_source", "batch_depth"),
+                        depth_loss_type=cfg.get("depth_loss_type", "l1"),
                     )
                     for key, value in metrics.items():
                         val_sum[key] = val_sum.get(key, 0.0) + value

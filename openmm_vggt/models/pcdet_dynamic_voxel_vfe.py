@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 def scatter_mean(src: torch.Tensor, index: torch.Tensor, dim_size: int) -> torch.Tensor:
     out = src.new_zeros((dim_size, src.shape[1]))
     counts = src.new_zeros((dim_size, 1))
@@ -135,13 +134,14 @@ class PCDetDynamicVoxelVFE(nn.Module):
         return self.out_dim
 
     def forward(self, points: torch.Tensor):
+        points_xyz = points[:, [1, 2, 3]].contiguous()
         points_coords = torch.floor(
-            (points[:, [1, 2, 3]] - self.point_cloud_range[[0, 1, 2]]) / self.voxel_size[[0, 1, 2]]
+            (points_xyz - self.point_cloud_range[[0, 1, 2]]) / self.voxel_size[[0, 1, 2]]
         ).int()
         mask = ((points_coords >= 0) & (points_coords < self.grid_size[[0, 1, 2]])).all(dim=1)
         points = points[mask]
+        points_xyz = points_xyz[mask]
         points_coords = points_coords[mask]
-        points_xyz = points[:, [1, 2, 3]].contiguous()
         if points.shape[0] == 0:
             return points.new_zeros((0, self.out_dim)), points.new_zeros((0, 4), dtype=torch.long)
 
@@ -162,11 +162,11 @@ class PCDetDynamicVoxelVFE(nn.Module):
         f_center[:, 2] = points_xyz[:, 2] - (points_coords[:, 2].to(points_xyz.dtype) * self.voxel_z + self.z_offset)
 
         if self.use_absolute_xyz:
-            features = [points[:, 1:], f_cluster, f_center]
+            features = [torch.cat([points_xyz, points[:, 4:]], dim=-1), f_cluster, f_center]
         else:
             features = [points[:, 4:], f_cluster, f_center]
         if self.with_distance:
-            points_dist = torch.norm(points[:, 1:4], 2, dim=1, keepdim=True)
+            points_dist = torch.norm(points_xyz, 2, dim=1, keepdim=True)
             features.append(points_dist)
         features = torch.cat(features, dim=-1)
 

@@ -54,7 +54,7 @@ class mix_decoder_global_window_attn_early(_MixDecoderGlobalBase):
         self.early_voxel_feature_proj = nn.Linear(self.voxel_encoder.get_output_feature_dim(), embed_dim)
         self.early_voxel_geometry_proj = VoxelPositionEncoder3D(
             embed_dim=embed_dim,
-            point_cloud_range=point_cloud_range,
+            point_cloud_range=self.fusion_point_cloud_range.cpu().tolist(),
         )
         if fusion_shift_size is None:
             fusion_shift_size = fusion_window_stride
