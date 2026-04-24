@@ -1,19 +1,21 @@
-# mmengine-style Python config for DDAD 6-camera depth fine-tuning.
-# This follows the KITTI early-fusion setup while supervising with sparse depth
-# projected from DDAD lidar.
+# mmengine-style Python config for DDAD 3-camera depth fine-tuning.
+# This variant keeps the DDAD temporal setup but restricts training to
+# CAMERA_01 / CAMERA_05 / CAMERA_06 to mimic a reduced multi-camera setup.
 
 ddad_scene_dataset_json = "/home/dataset-local/lr/code/openmm_vggt/data/ddad/ddad_train_val/ddad.json"
+
+camera_names = ("CAMERA_01", "CAMERA_05", "CAMERA_06")
 
 model = dict(
     type="mix_decoder_global_window_attn_early",
     img_size=518,
     patch_size=14,
     embed_dim=1024,
-    enable_camera=False,
+    enable_camera=True,
     enable_point=False,
     enable_depth=True,
     enable_track=False,
-    cam_num=6,
+    cam_num=3,
     voxel_size=(0.4, 0.4, 0.2),
     point_cloud_range=(-100.0, -100.0, -5.0, 100.0, 100.0, 3.0),
     serializer_grid_size_2d=14.0,
@@ -26,14 +28,15 @@ model = dict(
     fusion_attn_backend="auto",
 )
 
-image_size = (308, 490)
-n_time_steps = 2
+image_size = (350, 560)
+n_time_steps = 3
 stride = 1
 
 train_dataset = dict(
     type="DDADDepthTemporalDataset",
     root=ddad_scene_dataset_json,
     split="train",
+    camera_names=camera_names,
     n_time_steps=n_time_steps,
     stride=stride,
     image_size=image_size,
@@ -52,6 +55,7 @@ val_dataset = dict(
     type="DDADDepthTemporalDataset",
     root=ddad_scene_dataset_json,
     split="val",
+    camera_names=camera_names,
     n_time_steps=n_time_steps,
     stride=stride,
     image_size=image_size,
@@ -88,7 +92,7 @@ depth_supervision_source = "batch_depth"
 depth_pred_scale = 20.0
 
 checkpoint = "/home/dataset-local/lr/code/openmm_vggt/ckpt/checkpoint_5.pt"
-output_dir = "/home/dataset-local/lr/code/openmm_vggt/trainoutput/ddad_depth_6cam_mix_window_attn_early_ft"
+output_dir = "/home/dataset-local/lr/code/openmm_vggt/trainoutput/ddad_depth_3cam_010506_mix_window_attn_early_ft"
 
 epochs = 4
 grad_clip = 1.0
@@ -97,4 +101,13 @@ save_every = 1
 log_interval = 10
 seed = 42
 
+freeze_modules = (
+    "aggregator",
+    "camera_head",
+    "camera_relative_head",
+    "mv_blocks",
+    "rel_pose_embed",
+    "batch_norm",
+    "layer_norm",
+)
 freeze_modules_for_epochs = 4

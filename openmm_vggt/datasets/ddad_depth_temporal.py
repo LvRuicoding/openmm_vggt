@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -18,9 +17,15 @@ from torch.utils.data import Dataset
 from mmengine.registry import DATASETS
 
 # DGP resolves its cache directory at import time from DGP_PATH / HOME.
-# Defaulting to /tmp keeps the dataset usable in restricted environments while
-# still allowing callers to override DGP_PATH explicitly.
-os.environ.setdefault("DGP_PATH", str(Path(tempfile.gettempdir()) / "openmm_vggt_dgp"))
+# Default to the large data disk, while still allowing callers to override
+# DGP_PATH explicitly when needed.
+_default_dgp_root = Path(
+    os.environ.get("OPENMM_VGGT_DGP_PATH")
+    or os.environ.get("BC_LOCAL_STORAGE")
+    or "/home/dataset-local"
+) / "openmm_vggt_dgp"
+_default_dgp_root.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("DGP_PATH", str(_default_dgp_root))
 
 from dgp.datasets.synchronized_dataset import SynchronizedSceneDataset
 

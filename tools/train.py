@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import random
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, Tuple
@@ -142,6 +143,70 @@ def build_depth_supervision_target(
         return batch["depths"].float()
 
 
+def compute_balanced_depth_loss(
+    pred_depth: torch.Tensor,
+    gt_depth: torch.Tensor,
+    valid_mask: torch.Tensor,
+    n_time_steps: int,
+    cam_num: int,
+    depth_loss_type: str,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Average depth loss as batch -> frame -> camera -> valid pixels."""
+    if pred_depth.shape != gt_depth.shape:
+        raise ValueError(f"pred_depth shape {tuple(pred_depth.shape)} != gt_depth shape {tuple(gt_depth.shape)}")
+    if pred_depth.ndim != 4:
+        raise ValueError(f"Expected depth tensors with shape [B, S, H, W], got {tuple(pred_depth.shape)}")
+
+    batch_size, sequence_len, height, width = pred_depth.shape
+    expected_sequence_len = n_time_steps * cam_num
+    if sequence_len != expected_sequence_len:
+        raise ValueError(
+            f"Depth sequence length {sequence_len} does not match "
+            f"n_time_steps({n_time_steps}) * cam_num({cam_num}) = {expected_sequence_len}"
+        )
+
+    valid_mask = valid_mask.reshape(batch_size, n_time_steps, cam_num, height, width)
+    valid_float = valid_mask.to(dtype=pred_depth.dtype)
+
+    pred_depth = pred_depth.reshape(batch_size, n_time_steps, cam_num, height, width)
+    gt_depth = gt_depth.reshape(batch_size, n_time_steps, cam_num, height, width)
+
+    if depth_loss_type == "l1":
+        pixel_loss = torch.abs(pred_depth - gt_depth)
+    elif depth_loss_type == "log1p_l1":
+        safe_pred_depth = torch.where(valid_mask, pred_depth, torch.zeros_like(pred_depth))
+        safe_gt_depth = torch.where(valid_mask, gt_depth, torch.zeros_like(gt_depth))
+        pixel_loss = torch.abs(torch.log1p(safe_pred_depth) - torch.log1p(safe_gt_depth))
+    else:
+        raise ValueError(f"Unsupported depth_loss_type: {depth_loss_type}")
+
+    pixel_count = valid_float.sum(dim=(-1, -2))
+    camera_valid = pixel_count > 0
+    camera_loss_sum = (pixel_loss * valid_float).sum(dim=(-1, -2))
+    camera_loss = camera_loss_sum / pixel_count.clamp_min(1.0)
+
+    camera_weight = camera_valid.to(dtype=pixel_loss.dtype)
+    valid_camera_count = camera_weight.sum(dim=2)
+    frame_valid = valid_camera_count > 0
+    frame_loss = (camera_loss * camera_weight).sum(dim=2) / valid_camera_count.clamp_min(1.0)
+
+    frame_weight = frame_valid.to(dtype=pixel_loss.dtype)
+    valid_frame_count = frame_weight.sum(dim=1)
+    sample_valid = valid_frame_count > 0
+    sample_loss = (frame_loss * frame_weight).sum(dim=1) / valid_frame_count.clamp_min(1.0)
+
+    sample_weight = sample_valid.to(dtype=pixel_loss.dtype)
+    valid_sample_count = sample_weight.sum()
+    depth_loss = (sample_loss * sample_weight).sum() / valid_sample_count.clamp_min(1.0)
+
+    return depth_loss, {
+        "depth_valid_pixels": valid_mask.sum(),
+        "depth_valid_cameras": camera_valid.sum(),
+        "depth_valid_frames": frame_valid.sum(),
+        "depth_valid_samples": sample_valid.sum(),
+    }
+
+
 def compute_losses(
     predictions: Dict[str, torch.Tensor],
     batch: Dict[str, torch.Tensor],
@@ -154,27 +219,29 @@ def compute_losses(
     depth_pred_scale: float = 1.0,
     depth_supervision_source: str = "batch_depth",
     depth_loss_type: str = "l1",
+    n_time_steps: int = 1,
+    cam_num: int = 1,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     with torch.amp.autocast(device_type=batch["images"].device.type, enabled=False):
         pred_depth = (predictions["depth"].squeeze(-1) * depth_pred_scale).float()
         gt_depth = build_depth_supervision_target(batch, depth_supervision_source)
         valid_mask = (gt_depth > 0.0) & (gt_depth < 655.0)
-        if valid_mask.any():
-            valid_pred_depth = pred_depth[valid_mask]
-            valid_gt_depth = gt_depth[valid_mask]
-            if depth_loss_type == "l1":
-                depth_loss = F.l1_loss(valid_pred_depth, valid_gt_depth)
-            elif depth_loss_type == "log1p_l1":
-                depth_loss = F.l1_loss(torch.log1p(valid_pred_depth), torch.log1p(valid_gt_depth))
-            else:
-                raise ValueError(f"Unsupported depth_loss_type: {depth_loss_type}")
-        else:
-            depth_loss = pred_depth.new_zeros(())
+        depth_loss, depth_stats = compute_balanced_depth_loss(
+            pred_depth,
+            gt_depth,
+            valid_mask,
+            n_time_steps=n_time_steps,
+            cam_num=cam_num,
+            depth_loss_type=depth_loss_type,
+        )
     total = depth_weight * depth_loss
     metrics = {
         "loss": float(total.detach().cpu()),
         "depth_loss": float(depth_loss.detach().cpu()),
-        "depth_valid_pixels": float(valid_mask.sum().detach().cpu()),
+        "depth_valid_pixels": float(depth_stats["depth_valid_pixels"].detach().cpu()),
+        "depth_valid_cameras": float(depth_stats["depth_valid_cameras"].detach().cpu()),
+        "depth_valid_frames": float(depth_stats["depth_valid_frames"].detach().cpu()),
+        "depth_valid_samples": float(depth_stats["depth_valid_samples"].detach().cpu()),
     }
 
     if "seq_enc_list" in predictions and "intrinsics" in batch and camera_weight > 0:
@@ -349,10 +416,17 @@ def save_checkpoint(path: Path, model, optimizer, scheduler, epoch, step, cfg, s
     }, path)
 
 
-def append_loss_record(loss_file, step: int, loss: float) -> None:
+def sync_device_for_timing(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def append_loss_record(loss_file, step: int, loss: float, **extra_fields: float) -> None:
     if loss_file is None:
         return
-    loss_file.write(json.dumps({"step": step, "loss": loss}) + "\n")
+    payload = {"step": step, "loss": loss}
+    payload.update(extra_fields)
+    loss_file.write(json.dumps(payload) + "\n")
     loss_file.flush()
 
 
@@ -444,6 +518,8 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
     if cfg.get("freeze_backbone", False) and not freeze_prefixes:
         freeze_prefixes = ("aggregator",)
     freeze_for_epochs = int(cfg.get("freeze_modules_for_epochs", 0))
+    n_time_steps = int(cfg.get("n_time_steps", cfg.train_dataset.get("n_time_steps", 1)))
+    cam_num = int(cfg.model.get("cam_num", len(cfg.train_dataset.get("camera_names", ())) or 1))
 
     # ------------------------------------------------------------------
     # Resume: restore optimizer / scheduler / scaler / epoch from ckpt
@@ -486,41 +562,102 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
         running: Dict[str, float] = {}
         num_batches = 0
         train_bar = tqdm(train_loader, desc=f"Train E{epoch}", leave=False, disable=not is_main_process())
+        iter_end_time = time.perf_counter()
         for batch in train_bar:
-            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            normalized_extrinsics = normalize_extrinsics_to_first_frame(batch["extrinsics"])
+            data_time = time.perf_counter() - iter_end_time
 
+            sync_device_for_timing(device)
+            h2d_start_time = time.perf_counter()
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            sync_device_for_timing(device)
+            h2d_time = time.perf_counter() - h2d_start_time
+
+            sync_device_for_timing(device)
+            prep_start_time = time.perf_counter()
+            normalized_extrinsics = normalize_extrinsics_to_first_frame(batch["extrinsics"])
             optimizer.zero_grad(set_to_none=True)
+            sync_device_for_timing(device)
+            prep_time = time.perf_counter() - prep_start_time
+
+            sync_device_for_timing(device)
+            forward_start_time = time.perf_counter()
             with torch.cuda.amp.autocast(enabled=cfg.get("amp", True) and device.type == "cuda"):
                 predictions = model(batch["images"], others=build_model_others(batch, normalized_extrinsics))
-                loss, metrics = compute_losses(
-                    predictions,
-                    batch,
-                    normalized_extrinsics,
-                    depth_weight=cfg.depth_weight,
-                    camera_weight=cfg.get("camera_weight", 0.0),
-                    pose_translation_weight=cfg.get("pose_translation_weight", 1.0),
-                    pose_rotation_weight=cfg.get("pose_rotation_weight", 1.0),
-                    pose_fov_weight=cfg.get("pose_fov_weight", 1.0),
-                    depth_pred_scale=cfg.get("depth_pred_scale", 1.0),
-                    depth_supervision_source=cfg.get("depth_supervision_source", "batch_depth"),
-                    depth_loss_type=cfg.get("depth_loss_type", "l1"),
-                )
+            sync_device_for_timing(device)
+            forward_time = time.perf_counter() - forward_start_time
 
+            sync_device_for_timing(device)
+            loss_start_time = time.perf_counter()
+            loss, metrics = compute_losses(
+                predictions,
+                batch,
+                normalized_extrinsics,
+                depth_weight=cfg.depth_weight,
+                camera_weight=cfg.get("camera_weight", 0.0),
+                pose_translation_weight=cfg.get("pose_translation_weight", 1.0),
+                pose_rotation_weight=cfg.get("pose_rotation_weight", 1.0),
+                pose_fov_weight=cfg.get("pose_fov_weight", 1.0),
+                depth_pred_scale=cfg.get("depth_pred_scale", 1.0),
+                depth_supervision_source=cfg.get("depth_supervision_source", "batch_depth"),
+                depth_loss_type=cfg.get("depth_loss_type", "l1"),
+                n_time_steps=n_time_steps,
+                cam_num=cam_num,
+            )
+            sync_device_for_timing(device)
+            loss_time = time.perf_counter() - loss_start_time
+
+            sync_device_for_timing(device)
+            backward_start_time = time.perf_counter()
             scaler.scale(loss).backward()
+            sync_device_for_timing(device)
+            backward_time = time.perf_counter() - backward_start_time
+
+            grad_clip_time = 0.0
             if cfg.grad_clip > 0:
+                sync_device_for_timing(device)
+                grad_clip_start_time = time.perf_counter()
                 scaler.unscale_(optimizer)
                 active_trainable_params = [p for p in model.parameters() if p.requires_grad]
                 if active_trainable_params:
                     torch.nn.utils.clip_grad_norm_(active_trainable_params, cfg.grad_clip)
+                sync_device_for_timing(device)
+                grad_clip_time = time.perf_counter() - grad_clip_start_time
+
+            sync_device_for_timing(device)
+            optim_start_time = time.perf_counter()
             scaler.step(optimizer)
             scaler.update()
+            sync_device_for_timing(device)
+            optim_time = time.perf_counter() - optim_start_time
+
+            compute_time = (
+                prep_time
+                + forward_time
+                + loss_time
+                + backward_time
+                + grad_clip_time
+                + optim_time
+            )
 
             for key, value in metrics.items():
                 running[key] = running.get(key, 0.0) + value
             global_step += 1
-            append_loss_record(loss_file, global_step, metrics["loss"])
+            append_loss_record(
+                loss_file,
+                global_step,
+                metrics["loss"],
+                data_time=data_time,
+                h2d_time=h2d_time,
+                prep_time=prep_time,
+                forward_time=forward_time,
+                loss_time=loss_time,
+                backward_time=backward_time,
+                grad_clip_time=grad_clip_time,
+                optim_time=optim_time,
+                compute_time=compute_time,
+            )
             num_batches += 1
+            iter_end_time = time.perf_counter()
 
             cur_lr = optimizer.param_groups[0]["lr"]
             train_bar.set_postfix(loss=f"{metrics['loss']:.4f}", lr=f"{cur_lr:.2e}")
@@ -555,6 +692,8 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
                         depth_pred_scale=cfg.get("depth_pred_scale", 1.0),
                         depth_supervision_source=cfg.get("depth_supervision_source", "batch_depth"),
                         depth_loss_type=cfg.get("depth_loss_type", "l1"),
+                        n_time_steps=n_time_steps,
+                        cam_num=cam_num,
                     )
                     for key, value in metrics.items():
                         val_sum[key] = val_sum.get(key, 0.0) + value

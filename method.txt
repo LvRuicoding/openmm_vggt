@@ -1,0 +1,38 @@
+输入：
+    images_{t-k:t}
+    sparse LiDAR_{t-k:t}
+    camera intrinsics/extrinsics
+    poses
+
+VGGT 魔改版：
+    输出 depth-head feature F_img: [B,S,N,D]
+    输出 depth prediction depth: [B,S,H,W]
+
+Step 1: depth downsample
+    depth_patch: [B,S,Hp,Wp]
+
+Step 2: image token back-projection
+    对每个 patch center (u,v):
+        p_cam = depth_patch * K^{-1} [u,v,1]
+        p_target_lidar = T_target_lidar_cam_s @ p_cam
+
+Step 3: voxel scatter
+    把 F_img[b,s,h,w] scatter 到 target voxel grid
+    得到 F_img_voxel: [B,D_i,X,Y,Z]
+    得到 img_mask/count: [B,1,X,Y,Z]
+
+Step 4: LiDAR voxel branch
+    多帧 LiDAR 变换到 target LiDAR frame
+    voxel encoder 得到 F_lidar_voxel: [B,D_l,X,Y,Z]
+
+Step 5: voxel fusion
+    F = concat(F_img_voxel, F_lidar_voxel, img_mask, lidar_mask)
+    F = Conv3D/FusionBlock(F)
+
+Step 6: occupancy decoder
+    logits = decoder(F)
+    logits: [B,C,X,Y,Z]
+
+Step 7: loss
+    CE / weighted CE / Lovasz / occ BCE
+    target: [B,X,Y,Z]
