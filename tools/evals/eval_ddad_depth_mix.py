@@ -27,7 +27,7 @@ import openmm_vggt  # noqa: F401
 from openmm_vggt.utils.geometry import closed_form_inverse_se3
 
 
-DEFAULT_EVAL_CHECKPOINT_NAME = "epoch_004.pth"
+DEFAULT_EVAL_CHECKPOINT_NAME = "latest.pth"
 DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "early" / "ddad_depth_6cam_mix_window_attn_early_ft.py"
 DEFAULT_DESCRIPTION = "Evaluate DDAD depth fine-tuning results for mix early-fusion models."
 

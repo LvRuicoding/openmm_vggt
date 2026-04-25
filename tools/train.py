@@ -8,6 +8,7 @@ import os
 import random
 import time
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, Tuple
 
@@ -430,6 +431,11 @@ def append_loss_record(loss_file, step: int, loss: float, **extra_fields: float)
     loss_file.flush()
 
 
+def build_loss_log_path(output_dir: Path) -> Path:
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return output_dir / f"loss_steps_{run_timestamp}.jsonl"
+
+
 # ---------------------------------------------------------------------------
 # main training function
 # ---------------------------------------------------------------------------
@@ -508,7 +514,10 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(output_dir / "tb")) if is_main_process() else None
-    loss_file = (output_dir / "loss_steps.jsonl").open("w", encoding="utf-8") if is_main_process() else None
+    loss_path = build_loss_log_path(output_dir) if is_main_process() else None
+    loss_file = loss_path.open("w", encoding="utf-8") if loss_path is not None else None
+    if loss_path is not None:
+        log(f"Loss log path: {loss_path}")
 
     scaler = torch.cuda.amp.GradScaler(enabled=cfg.get("amp", True) and device.type == "cuda")
     best_val = float("inf")
