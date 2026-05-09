@@ -169,42 +169,109 @@ def _majority_assign(flat_indices: np.ndarray, labels: np.ndarray, target: np.nd
         while end < flat_indices.shape[0] and flat_indices[end] == current:
             end += 1
         counts = np.bincount(labels[start:end], minlength=20)
-        counts[0] = 0
         best = int(np.argmax(counts))
-        if best > 0:
-            target[current] = best
+        target[current] = np.uint8(best)
         start = end
 
 
-def _raycast_free_voxels(
-    occupied_mask: np.ndarray,
-    valid_mask: np.ndarray,
-    point_voxels: np.ndarray,
+def _mark_free_voxels(
+    points_xyz: np.ndarray,
     grid_size: np.ndarray,
+    voxel_size: np.ndarray,
+    point_cloud_range: np.ndarray,
+    occupied_flat_indices: np.ndarray,
+    target: np.ndarray,
+    valid_mask: np.ndarray,
 ) -> None:
-    unique_points = np.unique(point_voxels, axis=0)
+    if points_xyz.size == 0:
+        return
+
     origin = np.zeros(3, dtype=np.float32)
-    for endpoint in unique_points:
-        endpoint_f = endpoint.astype(np.float32) + 0.5
-        steps = int(np.max(np.abs(endpoint_f - origin)))
-        if steps <= 0:
+    occupied = set(int(index) for index in np.unique(occupied_flat_indices))
+    grid_y = int(grid_size[1])
+    grid_z = int(grid_size[2])
+
+    for point in points_xyz:
+        ray = point.astype(np.float32) - origin
+        ray_len = float(np.linalg.norm(ray))
+        if ray_len <= 1e-6:
             continue
-        line = np.linspace(origin, endpoint_f, num=steps + 1, endpoint=True)
-        traversed = np.floor(line).astype(np.int32)
-        traversed = np.clip(traversed, 0, grid_size.reshape(1, 3) - 1)
-        if traversed.shape[0] > 1:
-            traversed = traversed[:-1]
-        if traversed.size == 0:
-            continue
-        flat = (
-            traversed[:, 0] * grid_size[1] * grid_size[2]
-            + traversed[:, 1] * grid_size[2]
-            + traversed[:, 2]
+
+        step_count = max(int(np.ceil(ray_len / (float(np.min(voxel_size)) * 0.5))), 1)
+        # Exclude the endpoint so occupied voxels keep their semantic label.
+        ts = np.linspace(0.0, 1.0, step_count, endpoint=False, dtype=np.float32)
+        coords = np.floor((origin[None, :] + ts[:, None] * ray[None, :] - point_cloud_range[:3]) / voxel_size).astype(np.int32)
+        inside = (
+            (coords[:, 0] >= 0)
+            & (coords[:, 0] < grid_size[0])
+            & (coords[:, 1] >= 0)
+            & (coords[:, 1] < grid_size[1])
+            & (coords[:, 2] >= 0)
+            & (coords[:, 2] < grid_size[2])
         )
-        valid_mask.reshape(-1)[flat] = True
-        free_only = ~occupied_mask.reshape(-1)[flat]
-        if free_only.any():
-            valid_mask.reshape(-1)[flat[free_only]] = True
+        if not inside.any():
+            continue
+
+        coords = coords[inside]
+        flat = coords[:, 0] * grid_y * grid_z + coords[:, 1] * grid_z + coords[:, 2]
+        for flat_index in np.unique(flat):
+            flat_index = int(flat_index)
+            if flat_index in occupied:
+                continue
+            target[flat_index] = 0
+            valid_mask[flat_index] = True
+
+
+def _downsample_dense_labels_object_priority(
+    target: np.ndarray,
+    valid_mask: np.ndarray,
+    output_grid_size: np.ndarray,
+    ignore_index: int,
+    num_classes: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    output_grid_size = np.asarray(output_grid_size, dtype=np.int32)
+    if np.array_equal(np.asarray(target.shape, dtype=np.int32), output_grid_size):
+        return target, valid_mask
+
+    input_grid_size = np.asarray(target.shape, dtype=np.int32)
+    if np.any(input_grid_size % output_grid_size != 0):
+        raise RuntimeError(
+            f"Dense voxel grid {tuple(input_grid_size.tolist())} cannot be downsampled "
+            f"exactly to {tuple(output_grid_size.tolist())}"
+        )
+
+    factors = (input_grid_size // output_grid_size).astype(np.int32)
+    reshaped_target = target.reshape(
+        output_grid_size[0],
+        factors[0],
+        output_grid_size[1],
+        factors[1],
+        output_grid_size[2],
+        factors[2],
+    )
+    reshaped_valid = valid_mask.reshape(
+        output_grid_size[0],
+        factors[0],
+        output_grid_size[1],
+        factors[1],
+        output_grid_size[2],
+        factors[2],
+    )
+    blocks_target = reshaped_target.transpose(0, 2, 4, 1, 3, 5).reshape(-1, int(np.prod(factors)))
+    blocks_valid = reshaped_valid.transpose(0, 2, 4, 1, 3, 5).reshape(-1, int(np.prod(factors)))
+
+    output = np.full(blocks_target.shape[0], ignore_index, dtype=np.int64)
+    output_valid = blocks_valid.any(axis=1)
+    for block_idx in np.nonzero(output_valid)[0]:
+        labels = blocks_target[block_idx, blocks_valid[block_idx]]
+        object_labels = labels[(labels > 0) & (labels < num_classes)]
+        if object_labels.size > 0:
+            counts = np.bincount(object_labels, minlength=num_classes)
+            output[block_idx] = int(np.argmax(counts[1:]) + 1)
+        else:
+            output[block_idx] = 0
+
+    return output.reshape(*output_grid_size), output_valid.reshape(*output_grid_size)
 
 
 @DATASETS.register_module()
@@ -224,6 +291,7 @@ class KITTISemanticOccupancyDataset(Dataset):
         max_lidar_points: int = 32768,
         voxel_size: Tuple[float, float, float] = (0.2, 0.2, 0.2),
         point_cloud_range: Tuple[float, float, float, float, float, float] = (0.0, -25.6, -2.0, 51.2, 25.6, 4.4),
+        dense_voxel_root: Optional[str] = None,
         occupancy_cache_dir: Optional[str] = None,
     ) -> None:
         assert n_time_steps >= 1
@@ -247,6 +315,7 @@ class KITTISemanticOccupancyDataset(Dataset):
         self.grid_size = np.round((self.point_cloud_range[3:] - self.point_cloud_range[:3]) / self.voxel_size).astype(np.int32)
         self.num_classes = 20
         self.ignore_index = 255
+        self.dense_voxel_root = Path(dense_voxel_root) if dense_voxel_root is not None else None
 
         if occupancy_cache_dir is None:
             occupancy_cache_dir = str(self.semantic_root / "_occ_cache")
@@ -376,7 +445,52 @@ class KITTISemanticOccupancyDataset(Dataset):
 
     def _occupancy_cache_path(self, sequence_id: str, frame_id: str) -> Path:
         grid_tag = f"{self.grid_size[0]}_{self.grid_size[1]}_{self.grid_size[2]}"
-        return self.occupancy_cache_dir / f"{sequence_id}_{frame_id}_{grid_tag}.npz"
+        source_tag = "dense_v1" if self.dense_voxel_root is not None else "ssc_free_v1"
+        return self.occupancy_cache_dir / f"{sequence_id}_{frame_id}_{grid_tag}_{source_tag}.npz"
+
+    @staticmethod
+    def _unpack_voxel_mask(path: Path, expected_size: int) -> np.ndarray:
+        packed = np.fromfile(path, dtype=np.uint8)
+        mask = np.unpackbits(packed, bitorder="little")[:expected_size]
+        if mask.shape[0] != expected_size:
+            raise RuntimeError(f"Unexpected packed voxel mask size for {path}: {mask.shape[0]} != {expected_size}")
+        return mask.astype(bool)
+
+    def _load_dense_voxel_target(self, sequence_id: str, frame_id: str) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if self.dense_voxel_root is None:
+            return None
+
+        voxel_dir = self.dense_voxel_root / "sequences" / sequence_id / "voxels"
+        label_path = voxel_dir / f"{frame_id}.label"
+        invalid_path = voxel_dir / f"{frame_id}.invalid"
+        if not label_path.is_file():
+            return None
+
+        expected_size = int(np.prod(self.grid_size))
+        raw_label = np.fromfile(label_path, dtype=np.uint16)
+        source_size = raw_label.shape[0]
+        if source_size == expected_size:
+            source_grid_size = self.grid_size
+        elif source_size == 256 * 256 * 32:
+            source_grid_size = np.asarray((256, 256, 32), dtype=np.int32)
+        else:
+            raise RuntimeError(f"Unexpected dense voxel label size for {label_path}: {source_size}")
+
+        target = _raw_label_to_learning(raw_label.astype(np.uint32)).astype(np.int64)
+        valid_mask = np.ones(source_size, dtype=bool)
+        if invalid_path.is_file():
+            valid_mask &= ~self._unpack_voxel_mask(invalid_path, source_size)
+
+        target = target.reshape(*source_grid_size)
+        valid_mask = valid_mask.reshape(*source_grid_size)
+        target, valid_mask = _downsample_dense_labels_object_priority(
+            target=target,
+            valid_mask=valid_mask,
+            output_grid_size=self.grid_size,
+            ignore_index=self.ignore_index,
+            num_classes=self.num_classes,
+        )
+        return torch.from_numpy(target), torch.from_numpy(valid_mask)
 
     def _build_occupancy_target(self, record: _SequenceRecord, frame_id: str) -> Tuple[torch.Tensor, torch.Tensor]:
         cache_path = self._occupancy_cache_path(record.sequence_id, frame_id)
@@ -386,6 +500,12 @@ class KITTISemanticOccupancyDataset(Dataset):
                 torch.from_numpy(cached["target"].astype(np.int64)),
                 torch.from_numpy(cached["valid_mask"].astype(bool)),
             )
+
+        dense_target = self._load_dense_voxel_target(record.sequence_id, frame_id)
+        if dense_target is not None:
+            target, valid_mask = dense_target
+            np.savez_compressed(cache_path, target=target.numpy().astype(np.int64), valid_mask=valid_mask.numpy().astype(bool))
+            return target, valid_mask
 
         points = np.fromfile(record.semantic_root / "velodyne" / f"{frame_id}.bin", dtype=np.float32).reshape(-1, 4)
         labels = np.fromfile(record.semantic_root / "labels" / f"{frame_id}.label", dtype=np.uint32)
@@ -400,31 +520,36 @@ class KITTISemanticOccupancyDataset(Dataset):
             & (coords[:, 2] >= 0)
             & (coords[:, 2] < self.grid_size[2])
         )
+        points_inside = points[:, :3][inside]
         coords = coords[inside]
         learning_labels = learning_labels[inside]
+        semantic_known = learning_labels != 0
+        occupied_coords = coords[semantic_known]
+        occupied_labels = learning_labels[semantic_known]
 
-        occupied_target = np.full(int(np.prod(self.grid_size)), self.ignore_index, dtype=np.uint8)
+        target = np.full(int(np.prod(self.grid_size)), self.ignore_index, dtype=np.uint8)
         valid_mask = np.zeros(int(np.prod(self.grid_size)), dtype=bool)
-        occupied_mask = np.zeros(int(np.prod(self.grid_size)), dtype=bool)
 
-        occupied_points = learning_labels > 0
-        occupied_coords = coords[occupied_points]
-        occupied_labels = learning_labels[occupied_points]
-        if occupied_coords.shape[0] > 0:
-            occupied_flat = (
+        if points_inside.shape[0] > 0:
+            flat_indices = (
                 occupied_coords[:, 0] * self.grid_size[1] * self.grid_size[2]
                 + occupied_coords[:, 1] * self.grid_size[2]
                 + occupied_coords[:, 2]
             )
-            _majority_assign(occupied_flat, occupied_labels.astype(np.int64), occupied_target)
-            occupied_mask[occupied_flat] = True
-            valid_mask[occupied_flat] = True
+            if flat_indices.size > 0:
+                valid_mask[np.unique(flat_indices)] = True
+            _mark_free_voxels(
+                points_inside,
+                self.grid_size,
+                self.voxel_size,
+                self.point_cloud_range,
+                flat_indices,
+                target,
+                valid_mask,
+            )
+            _majority_assign(flat_indices, occupied_labels.astype(np.int64), target)
 
-        if coords.shape[0] > 0:
-            _raycast_free_voxels(occupied_mask.reshape(*self.grid_size), valid_mask.reshape(*self.grid_size), coords, self.grid_size)
-
-        target = occupied_target.reshape(*self.grid_size)
-        target[(valid_mask & ~occupied_mask).reshape(*self.grid_size)] = 0
+        target = target.reshape(*self.grid_size)
         valid_mask = valid_mask.reshape(*self.grid_size)
 
         np.savez_compressed(cache_path, target=target, valid_mask=valid_mask)

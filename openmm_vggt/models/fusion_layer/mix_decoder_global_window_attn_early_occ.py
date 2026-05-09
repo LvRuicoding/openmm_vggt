@@ -64,8 +64,6 @@ class mix_decoder_global_window_attn_early_occ(mix_decoder_global_window_attn_ea
             patch_size=patch_size,
             **occupancy_head,
         )
-        if self.occupancy_head is not None and self.depth_head is None:
-            raise ValueError("occupancy_head requires enable_depth=True")
 
     def _forward_from_aggregator_outputs(
         self,
@@ -182,20 +180,25 @@ class mix_decoder_global_window_attn_early_occ(mix_decoder_global_window_attn_ea
                 depth, depth_conf = self.depth_head(agg_layers_depths_tokens_list, images=images, patch_start_idx=0)
                 predictions["depth"] = self._camera_major_to_time_major(depth, batch_size, frame_count)
                 predictions["depth_conf"] = self._camera_major_to_time_major(depth_conf, batch_size, frame_count)
-                if self.occupancy_head is not None and others is not None:
-                    last_frame_tokens = agg_layers_depths_tokens_list[-1][:, -self.cam_num :, :, :]
-                    last_frame_depth = predictions["depth"][:, -self.cam_num :, ...]
-                    if last_frame_depth.ndim == 5 and last_frame_depth.shape[2] == 1:
-                        last_frame_depth = last_frame_depth.squeeze(2)
-                    elif last_frame_depth.ndim == 5 and last_frame_depth.shape[-1] == 1:
-                        last_frame_depth = last_frame_depth.squeeze(-1)
-                    predictions["occupancy_logits"] = self.occupancy_head(
-                        last_frame_tokens=last_frame_tokens,
-                        last_frame_depth=last_frame_depth,
-                        intrinsics=others["intrinsics"][:, -self.cam_num :, :, :],
-                        camera_to_world=others["camera_to_world"][:, -self.cam_num :, :, :],
-                        lidar_to_world=others["lidar_to_world"][:, -1, :, :],
-                    )
+
+            if self.occupancy_head is not None and others is not None:
+                occ_intrinsics = self._time_major_to_camera_major(
+                    others["intrinsics"],
+                    batch_size,
+                    frame_count,
+                )
+                occ_camera_to_world = self._time_major_to_camera_major(
+                    others["camera_to_world"],
+                    batch_size,
+                    frame_count,
+                )
+                predictions["occupancy_logits"] = self.occupancy_head(
+                    aggregated_tokens_list=agg_layers_depths_tokens_list,
+                    images=images,
+                    intrinsics=occ_intrinsics,
+                    camera_to_world=occ_camera_to_world,
+                    lidar_to_world=others["lidar_to_world"][:, -1, :, :],
+                )
 
             if self.point_head is not None:
                 pts3d, pts3d_conf = self.point_head(selected_layers, images=images, patch_start_idx=patch_start_idx)

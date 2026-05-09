@@ -31,7 +31,6 @@ occupancy_head=dict(
     point_cloud_range=occ_point_cloud_range,
     num_classes=20,
     hidden_dim=16,
-    depth_scale=20.0,
 )
 ```
 
@@ -177,11 +176,11 @@ predictions["occupancy_logits"] = self.occupancy_head(...)
 
 因此它就是从 2D 图像特征转成 3D occupancy 预测的桥梁。
 
-## 6. Occupancy 训练脚本
+## 6. Occupancy 训练入口
 
 对应的训练逻辑在这里：
 
-- [tools/occupancy_train.py](/home/dataset-local/lr/code/openmm_vggt/tools/occupancy_train.py:342)
+- [tools/train.py](/home/dataset-local/lr/code/openmm_vggt/tools/train.py:287)
 
 这里重点看 `compute_losses`。
 
@@ -208,7 +207,7 @@ occ_loss = F.cross_entropy(
 - `occupancy_iou`
 - `occupancy_valid_voxels`
 
-所以这个脚本就是 semantic occupancy 微调真正生效的地方。
+所以 semantic occupancy 微调复用通用训练入口，不再需要单独的 occupancy 训练脚本。
 
 ## 7. Semantic Occupancy 数据集实现
 
@@ -275,7 +274,7 @@ occ_loss = F.cross_entropy(
 
 ### 第四层：训练时怎么计算 occupancy loss
 
-- [tools/occupancy_train.py](/home/dataset-local/lr/code/openmm_vggt/tools/occupancy_train.py:342)
+- [tools/train.py](/home/dataset-local/lr/code/openmm_vggt/tools/train.py:287)
 
 ### 第五层：标签怎么构造
 
@@ -290,11 +289,10 @@ occ_loss = F.cross_entropy(
 - 在原 `mix_decoder_global_window_attn_early` 基础上
 - 新增 `mix_decoder_global_window_attn_early_occ`
 - 再新增一个 [occupancy_head.py](/home/dataset-local/lr/code/openmm_vggt/openmm_vggt/heads/occupancy_head.py:10)
-- 并配套新增 [occupancy_train.py](/home/dataset-local/lr/code/openmm_vggt/tools/occupancy_train.py:342) 和 [kitti_semantic_occ.py](/home/dataset-local/lr/code/openmm_vggt/openmm_vggt/datasets/kitti_semantic_occ.py:211)
+- 并配套复用 [tools/train.py](/home/dataset-local/lr/code/openmm_vggt/tools/train.py:287)，新增 [kitti_semantic_occ.py](/home/dataset-local/lr/code/openmm_vggt/openmm_vggt/datasets/kitti_semantic_occ.py:211)
 
 也就是说，最核心的“新增实现文件”就是这三个：
 
 - [openmm_vggt/models/fusion_layer/mix_decoder_global_window_attn_early_occ.py](/home/dataset-local/lr/code/openmm_vggt/openmm_vggt/models/fusion_layer/mix_decoder_global_window_attn_early_occ.py:15)
 - [openmm_vggt/heads/occupancy_head.py](/home/dataset-local/lr/code/openmm_vggt/openmm_vggt/heads/occupancy_head.py:10)
-- [tools/occupancy_train.py](/home/dataset-local/lr/code/openmm_vggt/tools/occupancy_train.py:342)
-
+- [tools/train.py](/home/dataset-local/lr/code/openmm_vggt/tools/train.py:287)

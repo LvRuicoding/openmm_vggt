@@ -217,33 +217,42 @@ def compute_losses(
     pose_translation_weight: float,
     pose_rotation_weight: float,
     pose_fov_weight: float,
+    occupancy_weight: float = 0.0,
+    occupancy_ignore_index: int = 255,
+    occupancy_class_weights: torch.Tensor | None = None,
     depth_pred_scale: float = 1.0,
     depth_supervision_source: str = "batch_depth",
     depth_loss_type: str = "l1",
     n_time_steps: int = 1,
     cam_num: int = 1,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    with torch.amp.autocast(device_type=batch["images"].device.type, enabled=False):
-        pred_depth = (predictions["depth"].squeeze(-1) * depth_pred_scale).float()
-        gt_depth = build_depth_supervision_target(batch, depth_supervision_source)
-        valid_mask = (gt_depth > 0.0) & (gt_depth < 655.0)
-        depth_loss, depth_stats = compute_balanced_depth_loss(
-            pred_depth,
-            gt_depth,
-            valid_mask,
-            n_time_steps=n_time_steps,
-            cam_num=cam_num,
-            depth_loss_type=depth_loss_type,
+    total = torch.zeros((), device=batch["images"].device, dtype=torch.float32)
+    metrics: Dict[str, float] = {"loss": 0.0}
+
+    if "depth" in predictions and depth_weight > 0:
+        with torch.amp.autocast(device_type=batch["images"].device.type, enabled=False):
+            pred_depth = (predictions["depth"].squeeze(-1) * depth_pred_scale).float()
+            gt_depth = build_depth_supervision_target(batch, depth_supervision_source)
+            valid_mask = (gt_depth > 0.0) & (gt_depth < 655.0)
+            depth_loss, depth_stats = compute_balanced_depth_loss(
+                pred_depth,
+                gt_depth,
+                valid_mask,
+                n_time_steps=n_time_steps,
+                cam_num=cam_num,
+                depth_loss_type=depth_loss_type,
+            )
+        total = total + depth_weight * depth_loss
+        metrics.update(
+            {
+                "loss": float(total.detach().cpu()),
+                "depth_loss": float(depth_loss.detach().cpu()),
+                "depth_valid_pixels": float(depth_stats["depth_valid_pixels"].detach().cpu()),
+                "depth_valid_cameras": float(depth_stats["depth_valid_cameras"].detach().cpu()),
+                "depth_valid_frames": float(depth_stats["depth_valid_frames"].detach().cpu()),
+                "depth_valid_samples": float(depth_stats["depth_valid_samples"].detach().cpu()),
+            }
         )
-    total = depth_weight * depth_loss
-    metrics = {
-        "loss": float(total.detach().cpu()),
-        "depth_loss": float(depth_loss.detach().cpu()),
-        "depth_valid_pixels": float(depth_stats["depth_valid_pixels"].detach().cpu()),
-        "depth_valid_cameras": float(depth_stats["depth_valid_cameras"].detach().cpu()),
-        "depth_valid_frames": float(depth_stats["depth_valid_frames"].detach().cpu()),
-        "depth_valid_samples": float(depth_stats["depth_valid_samples"].detach().cpu()),
-    }
 
     if "seq_enc_list" in predictions and "intrinsics" in batch and camera_weight > 0:
         image_hw = batch["images"].shape[-2:]
@@ -274,7 +283,67 @@ def compute_losses(
                 "pose_fov_loss": float(pose_fov_loss.detach().cpu()),
             }
         )
+
+    if "occupancy_logits" in predictions and "occupancy_target" in batch and occupancy_weight > 0:
+        occ_logits = predictions["occupancy_logits"].float()
+        occ_target = batch["occupancy_target"].long().masked_fill(~batch["occupancy_valid_mask"].bool(), occupancy_ignore_index)
+        occ_loss = F.cross_entropy(
+            occ_logits,
+            occ_target,
+            ignore_index=occupancy_ignore_index,
+            weight=occupancy_class_weights,
+        )
+        total = total + occupancy_weight * occ_loss
+        occ_pred = occ_logits.argmax(dim=1)
+        valid = occ_target != occupancy_ignore_index
+        occ_acc = (occ_pred[valid] == occ_target[valid]).float().mean().item() if valid.any() else 0.0
+        metrics.update(
+            {
+                "loss": float(total.detach().cpu()),
+                "occupancy_loss": float(occ_loss.detach().cpu()),
+                "occupancy_acc": float(occ_acc),
+                "occupancy_valid_voxels": float(valid.sum().item()),
+            }
+        )
     return total, metrics
+
+
+def accumulate_occupancy_stats(
+    stats: Dict[str, float],
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    valid_mask: torch.Tensor,
+    num_classes: int,
+    ignore_index: int,
+) -> None:
+    pred = logits.argmax(dim=1)
+    valid = valid_mask.bool() & (target != ignore_index)
+    if not valid.any():
+        return
+    pred_valid = pred[valid]
+    target_valid = target[valid]
+    stats["correct"] = stats.get("correct", 0.0) + float((pred_valid == target_valid).sum().item())
+    stats["total"] = stats.get("total", 0.0) + float(target_valid.numel())
+    for class_idx in range(num_classes):
+        pred_class = pred_valid == class_idx
+        target_class = target_valid == class_idx
+        stats[f"class_{class_idx}_intersection"] = stats.get(f"class_{class_idx}_intersection", 0.0) + float((pred_class & target_class).sum().item())
+        stats[f"class_{class_idx}_union"] = stats.get(f"class_{class_idx}_union", 0.0) + float((pred_class | target_class).sum().item())
+
+
+def summarize_occupancy_stats(stats: Dict[str, float], num_classes: int) -> Dict[str, float]:
+    if not stats:
+        return {}
+    acc = stats.get("correct", 0.0) / max(stats.get("total", 0.0), 1.0)
+    semantic_ious = []
+    for class_idx in range(1, num_classes):
+        union = stats.get(f"class_{class_idx}_union", 0.0)
+        if union > 0:
+            semantic_ious.append(stats.get(f"class_{class_idx}_intersection", 0.0) / union)
+    return {
+        "occupancy_acc": float(acc),
+        "ssc_miou": float(sum(semantic_ious) / max(len(semantic_ious), 1)),
+    }
 
 
 def load_model_from_checkpoint(
@@ -529,6 +598,14 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
     freeze_for_epochs = int(cfg.get("freeze_modules_for_epochs", 0))
     n_time_steps = int(cfg.get("n_time_steps", cfg.train_dataset.get("n_time_steps", 1)))
     cam_num = int(cfg.model.get("cam_num", len(cfg.train_dataset.get("camera_names", ())) or 1))
+    occupancy_weight = float(cfg.get("occupancy_weight", 0.0))
+    occupancy_ignore_index = int(cfg.get("occupancy_ignore_index", 255))
+    occupancy_num_classes = int(cfg.get("occupancy_num_classes", 20))
+    occupancy_class_weights = cfg.get("occupancy_class_weights", None)
+    if occupancy_class_weights is not None:
+        occupancy_class_weights = torch.tensor(occupancy_class_weights, dtype=torch.float32, device=device)
+    maximize_metric = occupancy_weight > 0
+    best_val = -float("inf") if maximize_metric else float("inf")
 
     # ------------------------------------------------------------------
     # Resume: restore optimizer / scheduler / scaler / epoch from ckpt
@@ -606,6 +683,9 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
                 pose_translation_weight=cfg.get("pose_translation_weight", 1.0),
                 pose_rotation_weight=cfg.get("pose_rotation_weight", 1.0),
                 pose_fov_weight=cfg.get("pose_fov_weight", 1.0),
+                occupancy_weight=occupancy_weight,
+                occupancy_ignore_index=occupancy_ignore_index,
+                occupancy_class_weights=occupancy_class_weights,
                 depth_pred_scale=cfg.get("depth_pred_scale", 1.0),
                 depth_supervision_source=cfg.get("depth_supervision_source", "batch_depth"),
                 depth_loss_type=cfg.get("depth_loss_type", "l1"),
@@ -673,7 +753,12 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
 
             if writer is not None and global_step % cfg.get("log_interval", 10) == 0:
                 writer.add_scalar("train/loss_step", metrics["loss"], global_step)
-                writer.add_scalar("train/depth_loss_step", metrics["depth_loss"], global_step)
+                if "depth_loss" in metrics:
+                    writer.add_scalar("train/depth_loss_step", metrics["depth_loss"], global_step)
+                if "occupancy_loss" in metrics:
+                    writer.add_scalar("train/occupancy_loss_step", metrics["occupancy_loss"], global_step)
+                if "occupancy_acc" in metrics:
+                    writer.add_scalar("train/occupancy_acc_step", metrics["occupancy_acc"], global_step)
 
         scheduler.step()
         train_avg = reduce_scalar_dict(running, num_batches, device)
@@ -683,6 +768,7 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
             model.eval()
             val_sum: Dict[str, float] = {}
             val_count = 0
+            val_occ_stats: Dict[str, float] = {}
             val_bar = tqdm(val_loader, desc=f"Val   E{epoch}", leave=False, disable=not is_main_process())
             with torch.no_grad():
                 for batch in val_bar:
@@ -698,6 +784,9 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
                         pose_translation_weight=cfg.get("pose_translation_weight", 1.0),
                         pose_rotation_weight=cfg.get("pose_rotation_weight", 1.0),
                         pose_fov_weight=cfg.get("pose_fov_weight", 1.0),
+                        occupancy_weight=occupancy_weight,
+                        occupancy_ignore_index=occupancy_ignore_index,
+                        occupancy_class_weights=occupancy_class_weights,
                         depth_pred_scale=cfg.get("depth_pred_scale", 1.0),
                         depth_supervision_source=cfg.get("depth_supervision_source", "batch_depth"),
                         depth_loss_type=cfg.get("depth_loss_type", "l1"),
@@ -707,7 +796,19 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
                     for key, value in metrics.items():
                         val_sum[key] = val_sum.get(key, 0.0) + value
                     val_count += 1
+                    if "occupancy_logits" in predictions:
+                        occ_target = batch["occupancy_target"].long().masked_fill(~batch["occupancy_valid_mask"].bool(), occupancy_ignore_index)
+                        accumulate_occupancy_stats(
+                            val_occ_stats,
+                            predictions["occupancy_logits"],
+                            occ_target,
+                            batch["occupancy_valid_mask"],
+                            occupancy_num_classes,
+                            occupancy_ignore_index,
+                        )
             val_metrics = reduce_scalar_dict(val_sum, val_count, device)
+            val_occ_stats = reduce_sum_dict(val_occ_stats, device)
+            val_metrics.update(summarize_occupancy_stats(val_occ_stats, occupancy_num_classes))
 
         log_line = (
             f"Epoch {epoch}/{cfg.epochs}"
@@ -728,9 +829,17 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
         if should_save:
             save_checkpoint(output_dir / f"epoch_{epoch:03d}.pth", model, optimizer, scheduler, epoch, global_step, cfg, scaler)
             save_checkpoint(output_dir / "last.pth", model, optimizer, scheduler, epoch, global_step, cfg, scaler)
-        if val_metrics and val_metrics["loss"] < best_val:
-            best_val = val_metrics["loss"]
-            save_checkpoint(output_dir / "best.pth", model, optimizer, scheduler, epoch, global_step, cfg, scaler)
+        if val_metrics:
+            if maximize_metric:
+                current_metric = val_metrics.get("ssc_miou", val_metrics.get("occupancy_acc", -float("inf")))
+                if current_metric > best_val:
+                    best_val = current_metric
+                    save_checkpoint(output_dir / "best.pth", model, optimizer, scheduler, epoch, global_step, cfg, scaler)
+            else:
+                current_metric = val_metrics.get("loss", float("inf"))
+                if current_metric < best_val:
+                    best_val = current_metric
+                    save_checkpoint(output_dir / "best.pth", model, optimizer, scheduler, epoch, global_step, cfg, scaler)
 
     if writer is not None:
         writer.close()

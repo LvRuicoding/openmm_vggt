@@ -2,12 +2,13 @@
 
 semantic_root = "/home/dataset-local/lr/code/openmm_vggt/data/kitti_semantic"
 raw_root = "/home/dataset-local/lr/code/openmm_vggt/data/kitti_raw"
+dense_voxel_root = "/home/dataset-local/lr/code/openmm_vggt/data/odemetry_voxels"
 
 image_size = (280, 518)
 n_time_steps = 3
 stride = 1
 
-occ_voxel_size = (0.2, 0.2, 0.2)
+occ_voxel_size = (0.4, 0.4, 0.8)
 occ_point_cloud_range = (0.0, -25.6, -2.0, 51.2, 25.6, 4.4)
 
 model = dict(
@@ -15,9 +16,9 @@ model = dict(
     img_size=518,
     patch_size=14,
     embed_dim=1024,
-    enable_camera=True,
+    enable_camera=False,
     enable_point=False,
-    enable_depth=True,
+    enable_depth=False,
     enable_track=False,
     cam_num=2,
     voxel_size=occ_voxel_size,
@@ -34,7 +35,6 @@ model = dict(
         point_cloud_range=occ_point_cloud_range,
         num_classes=20,
         hidden_dim=16,
-        depth_scale=20.0,
     ),
 )
 
@@ -50,6 +50,7 @@ train_dataset = dict(
     max_lidar_points=32768,
     voxel_size=occ_voxel_size,
     point_cloud_range=occ_point_cloud_range,
+    dense_voxel_root=dense_voxel_root,
     occupancy_cache_dir="/tmp/openmm_vggt_kitti_semantic_occ_cache_train",
 )
 
@@ -71,6 +72,7 @@ val_dataset = dict(
     max_lidar_points=32768,
     voxel_size=occ_voxel_size,
     point_cloud_range=occ_point_cloud_range,
+    dense_voxel_root=dense_voxel_root,
     occupancy_cache_dir="/tmp/openmm_vggt_kitti_semantic_occ_cache_val",
 )
 
@@ -114,5 +116,11 @@ save_every = 1
 log_interval = 10
 seed = 42
 
-freeze_modules = ()
-freeze_modules_for_epochs = 0
+freeze_modules = (
+      "aggregator",
+      "rel_pose_embed",
+      "layer_norm",
+      "batch_norm",
+      "mv_blocks",
+  )
+freeze_modules_for_epochs = 12
