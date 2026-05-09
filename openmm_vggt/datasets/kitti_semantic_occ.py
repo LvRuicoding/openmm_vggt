@@ -292,6 +292,7 @@ class KITTISemanticOccupancyDataset(Dataset):
         voxel_size: Tuple[float, float, float] = (0.2, 0.2, 0.2),
         point_cloud_range: Tuple[float, float, float, float, float, float] = (0.0, -25.6, -2.0, 51.2, 25.6, 4.4),
         dense_voxel_root: Optional[str] = None,
+        require_dense_voxel_target: bool = False,
         occupancy_cache_dir: Optional[str] = None,
     ) -> None:
         assert n_time_steps >= 1
@@ -316,6 +317,9 @@ class KITTISemanticOccupancyDataset(Dataset):
         self.num_classes = 20
         self.ignore_index = 255
         self.dense_voxel_root = Path(dense_voxel_root) if dense_voxel_root is not None else None
+        self.require_dense_voxel_target = bool(require_dense_voxel_target)
+        if self.require_dense_voxel_target and self.dense_voxel_root is None:
+            raise ValueError("require_dense_voxel_target=True requires dense_voxel_root to be set.")
 
         if occupancy_cache_dir is None:
             occupancy_cache_dir = str(self.semantic_root / "_occ_cache")
@@ -417,6 +421,20 @@ class KITTISemanticOccupancyDataset(Dataset):
         samples: List[Tuple[int, int]] = []
         for record_idx, record in enumerate(self.records):
             for last_idx in range(len(record.frame_ids)):
+                if self.require_dense_voxel_target:
+                    min_last_idx = (self.n_time_steps - 1) * self.stride
+                    if last_idx < min_last_idx:
+                        continue
+                    last_frame_id = record.frame_ids[last_idx]
+                    dense_label_path = (
+                        self.dense_voxel_root
+                        / "sequences"
+                        / record.sequence_id
+                        / "voxels"
+                        / f"{last_frame_id}.label"
+                    )
+                    if not dense_label_path.is_file():
+                        continue
                 samples.append((record_idx, last_idx))
         if self.max_samples is not None:
             samples = samples[: self.max_samples]

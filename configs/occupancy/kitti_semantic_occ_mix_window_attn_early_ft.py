@@ -51,6 +51,7 @@ train_dataset = dict(
     voxel_size=occ_voxel_size,
     point_cloud_range=occ_point_cloud_range,
     dense_voxel_root=dense_voxel_root,
+    require_dense_voxel_target=True,
     occupancy_cache_dir="/tmp/openmm_vggt_kitti_semantic_occ_cache_train",
 )
 
@@ -73,6 +74,7 @@ val_dataset = dict(
     voxel_size=occ_voxel_size,
     point_cloud_range=occ_point_cloud_range,
     dense_voxel_root=dense_voxel_root,
+    require_dense_voxel_target=True,
     occupancy_cache_dir="/tmp/openmm_vggt_kitti_semantic_occ_cache_val",
 )
 
@@ -123,4 +125,4 @@ freeze_modules = (
       "batch_norm",
       "mv_blocks",
   )
-freeze_modules_for_epochs = 12
+freeze_modules_for_epochs = 4
