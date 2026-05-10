@@ -110,7 +110,28 @@ depth_pred_scale = 20.0
 occupancy_weight = 1.0
 occupancy_num_classes = 20
 occupancy_ignore_index = 255
-occupancy_class_weights = [0.2] + [1.0] * 19
+occupancy_class_weights = [
+    0.0446,  # empty
+    0.0603,  # car
+    0.0852,  # bicycle
+    0.0856,  # motorcycle
+    0.0747,  # truck
+    0.0734,  # other-vehicle
+    0.0801,  # person
+    0.0796,  # bicyclist
+    0.0818,  # motorcyclist
+    0.0557,  # road
+    0.0653,  # parking
+    0.0568,  # sidewalk
+    0.0683,  # other-ground
+    0.0560,  # building
+    0.0603,  # fence
+    0.0530,  # vegetation
+    0.0688,  # trunk
+    0.0574,  # terrain
+    0.0716,  # pole
+    0.0786,  # traffic-sign
+]
 sem_scal_weight = 1.0
 geo_scal_weight = 1.0
 context_prior_weight = 1.0
