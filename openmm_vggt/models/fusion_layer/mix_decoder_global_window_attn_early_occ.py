@@ -5,6 +5,7 @@ from typing import List, Tuple
 import torch
 from mmengine.registry import MODELS
 
+from openmm_vggt.heads.monoscene_occupancy_head import MonoSceneOccupancyHead
 from openmm_vggt.heads.occupancy_head import OccupancyHead
 from openmm_vggt.utils.pose_enc import extri_to_pose_encoding, pose_encoding_to_extri_intri
 
@@ -59,11 +60,21 @@ class mix_decoder_global_window_attn_early_occ(mix_decoder_global_window_attn_ea
             fusion_mlp_ratio=fusion_mlp_ratio,
             fusion_attn_backend=fusion_attn_backend,
         )
-        self.occupancy_head = None if occupancy_head is None else OccupancyHead(
-            token_dim=2 * embed_dim,
-            patch_size=patch_size,
-            **occupancy_head,
-        )
+        self.occupancy_head = None
+        if occupancy_head is not None:
+            occupancy_head = dict(occupancy_head)
+            occupancy_head_type = occupancy_head.pop("type", "OccupancyHead")
+            occupancy_head_cls = {
+                "OccupancyHead": OccupancyHead,
+                "MonoSceneOccupancyHead": MonoSceneOccupancyHead,
+            }.get(occupancy_head_type)
+            if occupancy_head_cls is None:
+                raise ValueError(f"Unsupported occupancy head type: {occupancy_head_type}")
+            self.occupancy_head = occupancy_head_cls(
+                token_dim=2 * embed_dim,
+                patch_size=patch_size,
+                **occupancy_head,
+            )
 
     def _forward_from_aggregator_outputs(
         self,
@@ -192,13 +203,19 @@ class mix_decoder_global_window_attn_early_occ(mix_decoder_global_window_attn_ea
                     batch_size,
                     frame_count,
                 )
-                predictions["occupancy_logits"] = self.occupancy_head(
+                occupancy_outputs = self.occupancy_head(
                     aggregated_tokens_list=agg_layers_depths_tokens_list,
                     images=images,
                     intrinsics=occ_intrinsics,
                     camera_to_world=occ_camera_to_world,
                     lidar_to_world=others["lidar_to_world"][:, -1, :, :],
                 )
+                if isinstance(occupancy_outputs, dict):
+                    predictions["occupancy_logits"] = occupancy_outputs["ssc_logit"]
+                    if "P_logits" in occupancy_outputs:
+                        predictions["context_prior_logits"] = occupancy_outputs["P_logits"]
+                else:
+                    predictions["occupancy_logits"] = occupancy_outputs
 
             if self.point_head is not None:
                 pts3d, pts3d_conf = self.point_head(selected_layers, images=images, patch_start_idx=patch_start_idx)

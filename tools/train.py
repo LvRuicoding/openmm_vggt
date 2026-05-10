@@ -144,6 +144,148 @@ def build_depth_supervision_target(
         return batch["depths"].float()
 
 
+def geo_scal_loss(pred: torch.Tensor, target: torch.Tensor, ignore_index: int = 255, eps: float = 1e-6) -> torch.Tensor:
+    pred = F.softmax(pred, dim=1)
+    empty_probs = pred[:, 0]
+    nonempty_probs = 1.0 - empty_probs
+
+    mask = target != ignore_index
+    nonempty_target = (target != 0)[mask].float()
+    nonempty_probs = nonempty_probs[mask]
+    empty_probs = empty_probs[mask]
+    if nonempty_target.numel() == 0:
+        return pred.sum() * 0.0
+
+    intersection = (nonempty_target * nonempty_probs).sum()
+    precision = intersection / nonempty_probs.sum().clamp_min(eps)
+    recall = intersection / nonempty_target.sum().clamp_min(eps)
+    specificity = ((1.0 - nonempty_target) * empty_probs).sum() / (1.0 - nonempty_target).sum().clamp_min(eps)
+    one = torch.ones((), device=pred.device, dtype=pred.dtype)
+    return (
+        F.binary_cross_entropy(precision.clamp(eps, 1.0 - eps), one)
+        + F.binary_cross_entropy(recall.clamp(eps, 1.0 - eps), one)
+        + F.binary_cross_entropy(specificity.clamp(eps, 1.0 - eps), one)
+    )
+
+
+def sem_scal_loss(pred: torch.Tensor, target: torch.Tensor, ignore_index: int = 255, eps: float = 1e-6) -> torch.Tensor:
+    pred = F.softmax(pred, dim=1)
+    mask = target != ignore_index
+    valid_target = target[mask]
+    if valid_target.numel() == 0:
+        return pred.sum() * 0.0
+
+    loss = pred.new_zeros(())
+    count = 0
+    for class_idx in range(pred.shape[1]):
+        class_prob = pred[:, class_idx][mask]
+        class_target = (valid_target == class_idx).float()
+        if class_target.sum() <= 0:
+            continue
+        count += 1
+        intersection = (class_prob * class_target).sum()
+
+        precision = intersection / class_prob.sum().clamp_min(eps)
+        recall = intersection / class_target.sum().clamp_min(eps)
+        specificity = ((1.0 - class_prob) * (1.0 - class_target)).sum() / (1.0 - class_target).sum().clamp_min(eps)
+        one = torch.ones((), device=pred.device, dtype=pred.dtype)
+        loss = loss + F.binary_cross_entropy(precision.clamp(eps, 1.0 - eps), one)
+        loss = loss + F.binary_cross_entropy(recall.clamp(eps, 1.0 - eps), one)
+        loss = loss + F.binary_cross_entropy(specificity.clamp(eps, 1.0 - eps), one)
+    if count == 0:
+        return pred.sum() * 0.0
+    return loss / float(count)
+
+
+def downsample_target_object_priority(
+    target: torch.Tensor,
+    output_shape: Tuple[int, int, int],
+    ignore_index: int,
+    num_classes: int,
+) -> torch.Tensor:
+    """Downsample labels by majority vote, preferring occupied classes over empty."""
+    batch_size, grid_x, grid_y, grid_z = target.shape
+    out_x, out_y, out_z = output_shape
+    if grid_x % out_x != 0 or grid_y % out_y != 0 or grid_z % out_z != 0:
+        raise ValueError(f"Cannot downsample target shape {tuple(target.shape[1:])} to {output_shape}")
+    fx, fy, fz = grid_x // out_x, grid_y // out_y, grid_z // out_z
+    blocks = (
+        target.reshape(batch_size, out_x, fx, out_y, fy, out_z, fz)
+        .permute(0, 1, 3, 5, 2, 4, 6)
+        .reshape(batch_size, out_x * out_y * out_z, fx * fy * fz)
+    )
+    output = target.new_full((batch_size, out_x * out_y * out_z), ignore_index)
+    for batch_idx in range(batch_size):
+        for block_idx in range(blocks.shape[1]):
+            labels = blocks[batch_idx, block_idx]
+            labels = labels[labels != ignore_index]
+            if labels.numel() == 0:
+                continue
+            occupied = labels[(labels > 0) & (labels < num_classes)]
+            if occupied.numel() > 0:
+                counts = torch.bincount(occupied, minlength=num_classes)
+                output[batch_idx, block_idx] = torch.argmax(counts[1:]) + 1
+            else:
+                output[batch_idx, block_idx] = 0
+    return output.reshape(batch_size, out_x, out_y, out_z)
+
+
+def compute_context_prior_target(
+    target_l3: torch.Tensor,
+    ignore_index: int,
+    n_relations: int = 4,
+) -> torch.Tensor:
+    batch_size, grid_x, grid_y, grid_z = target_l3.shape
+    if n_relations != 4:
+        raise ValueError("Only the 4-relation MonoScene context prior target is supported.")
+    if grid_x % 2 != 0 or grid_y % 2 != 0 or grid_z % 2 != 0:
+        raise ValueError(f"Context-prior target shape must be divisible by 2, got {tuple(target_l3.shape[1:])}")
+
+    mega_x, mega_y, mega_z = grid_x // 2, grid_y // 2, grid_z // 2
+    num_voxels = grid_x * grid_y * grid_z
+    num_mega_voxels = mega_x * mega_y * mega_z
+    matrices = target_l3.new_zeros((batch_size, n_relations, num_voxels, num_mega_voxels), dtype=torch.float32)
+
+    for batch_idx in range(batch_size):
+        label_row = target_l3[batch_idx].reshape(-1)
+        valid_row = label_row != ignore_index
+        for xx in range(mega_x):
+            for yy in range(mega_y):
+                for zz in range(mega_z):
+                    col_idx = xx * (mega_y * mega_z) + yy * mega_z + zz
+                    labels = target_l3[
+                        batch_idx,
+                        xx * 2 : xx * 2 + 2,
+                        yy * 2 : yy * 2 + 2,
+                        zz * 2 : zz * 2 + 2,
+                    ].reshape(-1)
+                    labels = torch.unique(labels[labels != ignore_index])
+                    for label_col in labels:
+                        same = label_row == label_col
+                        label_col_nonempty = label_col != 0
+                        row_nonempty = label_row != 0
+                        matrices[batch_idx, 0, valid_row & same & label_col_nonempty, col_idx] = 1.0
+                        matrices[batch_idx, 1, valid_row & (~same) & label_col_nonempty & row_nonempty, col_idx] = 1.0
+                        matrices[batch_idx, 2, valid_row & same & (~label_col_nonempty), col_idx] = 1.0
+                        matrices[batch_idx, 3, valid_row & (~same) & ((~row_nonempty) | (~label_col_nonempty)), col_idx] = 1.0
+    return matrices
+
+
+def context_prior_loss(pred_logits: torch.Tensor, target_matrix: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    logits = []
+    labels = []
+    batch_size, n_relations, _, _ = pred_logits.shape
+    for batch_idx in range(batch_size):
+        logits.append(pred_logits[batch_idx].permute(0, 2, 1).reshape(n_relations, -1))
+        labels.append(target_matrix[batch_idx].reshape(n_relations, -1))
+    logits = torch.cat(logits, dim=1).T
+    labels = torch.cat(labels, dim=1).T
+    cnt_neg = (labels == 0).sum(dim=0).to(dtype=logits.dtype)
+    cnt_pos = labels.sum(dim=0).to(dtype=logits.dtype)
+    pos_weight = cnt_neg / cnt_pos.clamp_min(eps)
+    return F.binary_cross_entropy_with_logits(logits, labels.to(dtype=logits.dtype), pos_weight=pos_weight)
+
+
 def compute_balanced_depth_loss(
     pred_depth: torch.Tensor,
     gt_depth: torch.Tensor,
@@ -220,6 +362,10 @@ def compute_losses(
     occupancy_weight: float = 0.0,
     occupancy_ignore_index: int = 255,
     occupancy_class_weights: torch.Tensor | None = None,
+    occupancy_num_classes: int = 20,
+    sem_scal_weight: float = 0.0,
+    geo_scal_weight: float = 0.0,
+    context_prior_weight: float = 0.0,
     depth_pred_scale: float = 1.0,
     depth_supervision_source: str = "batch_depth",
     depth_loss_type: str = "l1",
@@ -294,6 +440,50 @@ def compute_losses(
             weight=occupancy_class_weights,
         )
         total = total + occupancy_weight * occ_loss
+        extra_occ_metrics = {}
+        if sem_scal_weight > 0:
+            sem_loss = sem_scal_loss(occ_logits, occ_target, ignore_index=occupancy_ignore_index)
+            total = total + sem_scal_weight * sem_loss
+            extra_occ_metrics["sem_scal_loss"] = float(sem_loss.detach().cpu())
+        if geo_scal_weight > 0:
+            geo_loss = geo_scal_loss(occ_logits, occ_target, ignore_index=occupancy_ignore_index)
+            total = total + geo_scal_weight * geo_loss
+            extra_occ_metrics["geo_scal_loss"] = float(geo_loss.detach().cpu())
+        if context_prior_weight > 0 and "context_prior_logits" in predictions:
+            cp_logits = predictions["context_prior_logits"].float()
+            _, n_relations, context_count, voxel_count = cp_logits.shape
+            # P_logits has shape [B, R, mega_voxels, l3_voxels].
+            # Infer the l3 grid from the full target aspect ratio and voxel count.
+            target_shape = occ_target.shape[1:]
+            down_factor = round((int(np.prod(target_shape)) / float(voxel_count)) ** (1.0 / 3.0))
+            if down_factor < 1:
+                raise ValueError(f"Invalid context-prior down_factor inferred from {target_shape} and {voxel_count}")
+            l3_shape = tuple(int(dim // down_factor) for dim in target_shape)
+            if int(np.prod(l3_shape)) != voxel_count:
+                raise ValueError(
+                    f"Cannot infer context-prior l3 shape: target={tuple(target_shape)}, "
+                    f"voxel_count={voxel_count}, inferred={l3_shape}"
+                )
+            expected_context_count = int(np.prod(tuple(dim // 2 for dim in l3_shape)))
+            if expected_context_count != context_count:
+                raise ValueError(
+                    f"Context-prior mega-voxel count mismatch: logits={context_count}, "
+                    f"expected={expected_context_count} from l3_shape={l3_shape}"
+                )
+            occ_target_l3 = downsample_target_object_priority(
+                occ_target,
+                output_shape=l3_shape,
+                ignore_index=occupancy_ignore_index,
+                num_classes=occupancy_num_classes,
+            )
+            cp_target = compute_context_prior_target(
+                occ_target_l3,
+                ignore_index=occupancy_ignore_index,
+                n_relations=n_relations,
+            )
+            cp_loss = context_prior_loss(cp_logits, cp_target)
+            total = total + context_prior_weight * cp_loss
+            extra_occ_metrics["context_prior_loss"] = float(cp_loss.detach().cpu())
         occ_pred = occ_logits.argmax(dim=1)
         valid = occ_target != occupancy_ignore_index
         occ_acc = (occ_pred[valid] == occ_target[valid]).float().mean().item() if valid.any() else 0.0
@@ -303,6 +493,7 @@ def compute_losses(
                 "occupancy_loss": float(occ_loss.detach().cpu()),
                 "occupancy_acc": float(occ_acc),
                 "occupancy_valid_voxels": float(valid.sum().item()),
+                **extra_occ_metrics,
             }
         )
     return total, metrics
@@ -604,6 +795,9 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
     occupancy_class_weights = cfg.get("occupancy_class_weights", None)
     if occupancy_class_weights is not None:
         occupancy_class_weights = torch.tensor(occupancy_class_weights, dtype=torch.float32, device=device)
+    sem_scal_weight = float(cfg.get("sem_scal_weight", 0.0))
+    geo_scal_weight = float(cfg.get("geo_scal_weight", 0.0))
+    context_prior_weight = float(cfg.get("context_prior_weight", 0.0))
     maximize_metric = occupancy_weight > 0
     best_val = -float("inf") if maximize_metric else float("inf")
 
@@ -686,6 +880,10 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
                 occupancy_weight=occupancy_weight,
                 occupancy_ignore_index=occupancy_ignore_index,
                 occupancy_class_weights=occupancy_class_weights,
+                occupancy_num_classes=occupancy_num_classes,
+                sem_scal_weight=sem_scal_weight,
+                geo_scal_weight=geo_scal_weight,
+                context_prior_weight=context_prior_weight,
                 depth_pred_scale=cfg.get("depth_pred_scale", 1.0),
                 depth_supervision_source=cfg.get("depth_supervision_source", "batch_depth"),
                 depth_loss_type=cfg.get("depth_loss_type", "l1"),
@@ -787,6 +985,10 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
                         occupancy_weight=occupancy_weight,
                         occupancy_ignore_index=occupancy_ignore_index,
                         occupancy_class_weights=occupancy_class_weights,
+                        occupancy_num_classes=occupancy_num_classes,
+                        sem_scal_weight=sem_scal_weight,
+                        geo_scal_weight=geo_scal_weight,
+                        context_prior_weight=context_prior_weight,
                         depth_pred_scale=cfg.get("depth_pred_scale", 1.0),
                         depth_supervision_source=cfg.get("depth_supervision_source", "batch_depth"),
                         depth_loss_type=cfg.get("depth_loss_type", "l1"),

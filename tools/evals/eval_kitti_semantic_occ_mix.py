@@ -334,13 +334,25 @@ def format_report(config_path: str, ckpt_path: str, batch_size: int, num_workers
     return "\n".join(lines) + "\n"
 
 
-def save_report(ckpt_path: str, report: str) -> Optional[Path]:
-    report_path = Path(ckpt_path).with_suffix(".txt")
+def save_report(ckpt_path: str, report: str, out_file: Optional[str] = None) -> Optional[Path]:
+    report_path = Path(out_file) if out_file else Path(ckpt_path).with_suffix(".txt")
     try:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(report, encoding="utf-8")
     except OSError as exc:
         log(f"WARNING: failed to save metrics to {report_path}: {exc}")
-        return None
+        if out_file:
+            return None
+        fallback_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "openmm_vggt_eval_metrics"
+        fallback_path = fallback_dir / f"{Path(ckpt_path).stem}.txt"
+        try:
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            fallback_path.write_text(report, encoding="utf-8")
+        except OSError as fallback_exc:
+            log(f"WARNING: failed to save metrics fallback to {fallback_path}: {fallback_exc}")
+            return None
+        log(f"Saved metrics fallback to: {fallback_path}")
+        return fallback_path
     return report_path
 
 
@@ -351,6 +363,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--max-samples", type=int, default=None, help="Cap validation samples for quick checks.")
+    parser.add_argument("--out-file", default=None, help="Optional path for the metrics .txt report.")
     parser.add_argument(
         "--image-size",
         nargs=2,
@@ -442,7 +455,7 @@ def main() -> None:
                 metrics=metrics,
             )
             print("\n" + report, flush=True)
-            report_path = save_report(ckpt_path, report)
+            report_path = save_report(ckpt_path, report, out_file=args.out_file)
             if report_path is not None:
                 print(f"Saved metrics to: {report_path}", flush=True)
     finally:
