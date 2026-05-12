@@ -204,49 +204,32 @@ class mix_decoder_global_window_attn_early_occ(mix_decoder_global_window_attn_ea
                     frame_count,
                 )
                 last_frame_lidar_to_world = others["lidar_to_world"][:, -1, :, :]
-                occ_outputs_by_camera = []
-                for cam_idx in range(self.cam_num):
-                    view_idx = cam_idx * frame_count + (frame_count - 1)
-                    view_index = torch.tensor([view_idx], device=occ_intrinsics.device, dtype=torch.long)
-                    token_view_index = view_index.to(agg_layers_depths_tokens_list[0].device)
-                    occ_depth_tokens = [
-                        layer_tokens.index_select(1, token_view_index)
-                        for layer_tokens in agg_layers_depths_tokens_list
-                    ]
-                    occ_outputs_by_camera.append(
-                        self.occupancy_head(
-                            aggregated_tokens_list=occ_depth_tokens,
-                            images=images,
-                            intrinsics=occ_intrinsics.index_select(1, view_index),
-                            camera_to_world=occ_camera_to_world.index_select(1, view_index),
-                            lidar_to_world=last_frame_lidar_to_world,
-                        )
-                    )
+                view_indices = torch.arange(
+                    frame_count - 1,
+                    self.cam_num * frame_count,
+                    frame_count,
+                    device=occ_intrinsics.device,
+                    dtype=torch.long,
+                )
+                token_view_indices = view_indices.to(agg_layers_depths_tokens_list[0].device)
+                occ_depth_tokens = [
+                    layer_tokens.index_select(1, token_view_indices)
+                    for layer_tokens in agg_layers_depths_tokens_list
+                ]
+                occ_outputs = self.occupancy_head(
+                    aggregated_tokens_list=occ_depth_tokens,
+                    images=images,
+                    intrinsics=occ_intrinsics.index_select(1, view_indices),
+                    camera_to_world=occ_camera_to_world.index_select(1, view_indices),
+                    lidar_to_world=last_frame_lidar_to_world,
+                )
 
-                if isinstance(occ_outputs_by_camera[0], dict):
-                    occupancy_logits = torch.stack(
-                        [outputs["ssc_logit"] for outputs in occ_outputs_by_camera],
-                        dim=1,
-                    )
-                    predictions["occupancy_logits"] = occupancy_logits.reshape(
-                        batch_size * self.cam_num,
-                        *occupancy_logits.shape[2:],
-                    )
-                    if "P_logits" in occ_outputs_by_camera[0]:
-                        context_prior_logits = torch.stack(
-                            [outputs["P_logits"] for outputs in occ_outputs_by_camera],
-                            dim=1,
-                        )
-                        predictions["context_prior_logits"] = context_prior_logits.reshape(
-                            batch_size * self.cam_num,
-                            *context_prior_logits.shape[2:],
-                        )
+                if isinstance(occ_outputs, dict):
+                    predictions["occupancy_logits"] = occ_outputs["ssc_logit"]
+                    if "P_logits" in occ_outputs:
+                        predictions["context_prior_logits"] = occ_outputs["P_logits"]
                 else:
-                    occupancy_logits = torch.stack(occ_outputs_by_camera, dim=1)
-                    predictions["occupancy_logits"] = occupancy_logits.reshape(
-                        batch_size * self.cam_num,
-                        *occupancy_logits.shape[2:],
-                    )
+                    predictions["occupancy_logits"] = occ_outputs
 
             if self.point_head is not None:
                 pts3d, pts3d_conf = self.point_head(selected_layers, images=images, patch_start_idx=patch_start_idx)

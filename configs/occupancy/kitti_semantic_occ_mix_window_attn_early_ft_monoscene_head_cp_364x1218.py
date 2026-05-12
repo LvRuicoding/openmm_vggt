@@ -8,7 +8,8 @@ image_size = (364, 1218)
 n_time_steps = 3
 stride = 1
 
-occ_voxel_size = (0.2, 0.2, 0.4)
+fusion_voxel_size = (0.4, 0.4, 0.8)
+occ_voxel_size = (0.2, 0.2, 0.2)
 occ_point_cloud_range = (0.0, -25.6, -2.0, 51.2, 25.6, 4.4)
 
 model = dict(
@@ -21,7 +22,7 @@ model = dict(
     enable_depth=False,
     enable_track=False,
     cam_num=2,
-    voxel_size=occ_voxel_size,
+    voxel_size=fusion_voxel_size,
     point_cloud_range=occ_point_cloud_range,
     serializer_grid_size_2d=14.0,
     use_top_k=False,
@@ -58,6 +59,7 @@ train_dataset = dict(
     require_dense_voxel_target=True,
     occupancy_cache_dir="/tmp/openmm_vggt_kitti_semantic_occ_cache_train",
     frustum_size=4,
+    color_jitter=(0.4, 0.4, 0.4),
 )
 
 train_dataloader = dict(
@@ -95,6 +97,7 @@ optimizer = dict(
     lr=2e-5,
     weight_decay=0.05,
 )
+random_init_lr_multiplier = 10.0
 
 scheduler = dict(
     type="CosineAnnealingLR",
@@ -142,10 +145,10 @@ context_prior_weight = 1.0
 checkpoint = "/home/dataset-local/lr/code/openmm_vggt/ckpt/checkpoint_5.pt"
 output_dir = "/home/dataset-local/lr/code/openmm_vggt/trainoutput/kitti_semantic_occ_mix_window_attn_early_ft_monoscene_head_cp_364x1218"
 
-epochs = 12
+epochs = 8
 grad_clip = 1.0
 amp = True
-save_every = 1
+save_every = 2
 log_interval = 10
 seed = 42
 
@@ -156,4 +159,4 @@ freeze_modules = (
       "batch_norm",
       "mv_blocks",
   )
-freeze_modules_for_epochs = 4
+freeze_modules_for_epochs = 2

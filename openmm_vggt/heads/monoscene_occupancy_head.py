@@ -531,11 +531,6 @@ class MonoSceneOccupancyHead(nn.Module):
             raise ValueError(f"Expected tokens with shape [B, S, N, D], got {tuple(tokens.shape)}")
 
         batch_size, view_count, patch_count, token_dim = tokens.shape
-        if view_count != 1:
-            raise ValueError(
-                "MonoSceneOccupancyHead expects single-view samples. "
-                f"Flatten camera views into the batch dimension before calling it; got view_count={view_count}."
-            )
         image_h, image_w = images.shape[-2:]
         patch_h = image_h // self.patch_size
         patch_w = image_w // self.patch_size
@@ -590,7 +585,10 @@ class MonoSceneOccupancyHead(nn.Module):
                     valid=valid,
                 )
                 sampled = sampled.permute(0, 2, 1).reshape(batch_size, view_count, chunk_voxels, token_dim)
-                layer_feats.append(layer_proj(sampled.squeeze(1)))
+                view_weights = valid.to(dtype=sampled.dtype).unsqueeze(-1)
+                sampled_sum = (sampled * view_weights).sum(dim=1)
+                view_count_valid = view_weights.sum(dim=1).clamp_min(1.0)
+                layer_feats.append(layer_proj(sampled_sum / view_count_valid))
 
             voxel_feat = self.layer_fuse(torch.cat(layer_feats, dim=-1))
             fused = self.fuse(

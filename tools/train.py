@@ -10,7 +10,7 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Set, Tuple
 
 import numpy as np
 import torch
@@ -572,6 +572,13 @@ def align_frustum_targets_to_logits(
     if frustums_masks.shape[0] == logits_batch and frustums_masks.ndim == 5:
         return frustums_masks.to(device=logits.device), frustums_class_dists.to(device=logits.device)
 
+    if frustums_masks.shape[0] == logits_batch and frustums_masks.ndim == 6:
+        batch_size, view_count, frustum_count = frustums_masks.shape[:3]
+        return (
+            frustums_masks.reshape(batch_size, view_count * frustum_count, *frustums_masks.shape[3:]).to(device=logits.device),
+            frustums_class_dists.reshape(batch_size, view_count * frustum_count, *frustums_class_dists.shape[3:]).to(device=logits.device),
+        )
+
     if frustums_masks.ndim == 6 and frustums_masks.shape[0] * frustums_masks.shape[1] == logits_batch:
         return (
             frustums_masks.reshape(logits_batch, *frustums_masks.shape[2:]).to(device=logits.device),
@@ -651,6 +658,7 @@ def load_model_from_checkpoint(
         print(f"[load_checkpoint] WARNING: {len(missing)} keys not in checkpoint (will use random init): {missing[:20]}")
 
     mismatched = []
+    random_init_keys = set(missing)
     filtered = {}
     for key in model_keys:
         if key in missing:
@@ -659,10 +667,14 @@ def load_model_from_checkpoint(
         ckpt_tensor = state_dict[key]
         if ckpt_tensor.shape != tensor.shape:
             mismatched.append((key, tuple(tensor.shape), tuple(ckpt_tensor.shape)))
+            random_init_keys.add(key)
         else:
             filtered[key] = ckpt_tensor
 
     model.load_state_dict(filtered, strict=False)
+    model._random_init_param_names = {
+        name for name, _ in model.named_parameters() if name in random_init_keys
+    }
     extras = sorted(set(state_dict) - set(model_state))
 
     loaded_prefix_counts = defaultdict(int)
@@ -676,6 +688,9 @@ def load_model_from_checkpoint(
     ]
     if mismatched:
         message_parts.append(f"shape mismatches: {mismatched[:5]}")
+    if model._random_init_param_names:
+        sample = sorted(model._random_init_param_names)[:20]
+        message_parts.append(f"random-init params={len(model._random_init_param_names)} sample={sample}")
     if loaded_prefix_counts:
         prefix_msg = ", ".join(f"{prefix}={count}" for prefix, count in sorted(loaded_prefix_counts.items()))
         message_parts.append(f"prefixes[{prefix_msg}]")
@@ -723,11 +738,17 @@ def build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.Optimizer:
         raise ValueError(f"Unsupported optimizer type: {opt_cfg.type}")
 
     lr_multipliers = dict(cfg.get("lr_multipliers", {}))
+    random_init_param_names: Set[str] = set(getattr(unwrap_model(model), "_random_init_param_names", set()))
+    random_init_multiplier = float(cfg.get("random_init_lr_multiplier", 1.0))
     grouped_params: Dict[Tuple[str, float], list[nn.Parameter]] = defaultdict(list)
     group_counts: Dict[Tuple[str, float], int] = defaultdict(int)
 
     for name, param in model.named_parameters():
-        multiplier, label = resolve_lr_multiplier(name, lr_multipliers)
+        bare_name = name[len("module."):] if name.startswith("module.") else name
+        multiplier, label = resolve_lr_multiplier(bare_name, lr_multipliers)
+        if bare_name in random_init_param_names:
+            multiplier *= random_init_multiplier
+            label = f"random_init:{label}"
         group_key = (label, multiplier)
         grouped_params[group_key].append(param)
         group_counts[group_key] += param.numel()
@@ -859,7 +880,7 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
     sch_cfg = cfg.scheduler
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=max(cfg.epochs, 1),
+        T_max=max(int(sch_cfg.get("T_max", cfg.epochs)), 1),
         eta_min=sch_cfg.eta_min,
     )
 

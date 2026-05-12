@@ -295,6 +295,7 @@ class KITTISemanticOccupancyDataset(Dataset):
         require_dense_voxel_target: bool = False,
         occupancy_cache_dir: Optional[str] = None,
         frustum_size: int = 0,
+        color_jitter: Optional[Tuple[float, float, float]] = None,
     ) -> None:
         assert n_time_steps >= 1
         assert image_size[0] % 14 == 0 and image_size[1] % 14 == 0
@@ -322,6 +323,11 @@ class KITTISemanticOccupancyDataset(Dataset):
         self.frustum_size = int(frustum_size)
         if self.frustum_size < 0:
             raise ValueError(f"frustum_size must be >= 0, got {self.frustum_size}")
+        self.color_jitter = None
+        if color_jitter is not None:
+            if len(color_jitter) != 3:
+                raise ValueError(f"color_jitter must be a 3-tuple, got {color_jitter}")
+            self.color_jitter = tuple(float(value) for value in color_jitter)
         if self.require_dense_voxel_target and self.dense_voxel_root is None:
             raise ValueError("require_dense_voxel_target=True requires dense_voxel_root to be set.")
 
@@ -684,6 +690,32 @@ class KITTISemanticOccupancyDataset(Dataset):
         )
         return torch.from_numpy(frustum_masks), torch.from_numpy(frustum_class_dists)
 
+    def _sample_color_jitter(self) -> Optional[Tuple[float, float, float]]:
+        if self.color_jitter is None:
+            return None
+        brightness, contrast, saturation = self.color_jitter
+        return (
+            float(torch.empty((), dtype=torch.float32).uniform_(max(0.0, 1.0 - brightness), 1.0 + brightness).item()),
+            float(torch.empty((), dtype=torch.float32).uniform_(max(0.0, 1.0 - contrast), 1.0 + contrast).item()),
+            float(torch.empty((), dtype=torch.float32).uniform_(max(0.0, 1.0 - saturation), 1.0 + saturation).item()),
+        )
+
+    @staticmethod
+    def _apply_color_jitter(image: torch.Tensor, factors: Optional[Tuple[float, float, float]]) -> torch.Tensor:
+        if factors is None:
+            return image
+        brightness, contrast, saturation = factors
+        image = image * brightness
+        mean = image.mean(dim=(1, 2), keepdim=True)
+        image = (image - mean) * contrast + mean
+        gray = (
+            image[0:1] * 0.2989
+            + image[1:2] * 0.5870
+            + image[2:3] * 0.1140
+        )
+        image = (image - gray) * saturation + gray
+        return image.clamp_(0.0, 1.0)
+
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         record_idx, last_idx = self.samples[index]
         record = self.records[record_idx]
@@ -704,6 +736,7 @@ class KITTISemanticOccupancyDataset(Dataset):
         lidar_mask_list: List[torch.Tensor] = []
 
         orig_hw = record.raw_hw
+        color_jitter_factors = self._sample_color_jitter()
 
         for frame_id in time_frame_ids:
             for camera_name in ("image_02", "image_03"):
@@ -717,6 +750,7 @@ class KITTISemanticOccupancyDataset(Dataset):
                     extrinsics = record.extrinsics_03[frame_id]
 
                 image, _ = preprocess_rgb_like_demo(image_path, self.image_size)
+                image = self._apply_color_jitter(image, color_jitter_factors)
                 images_list.append(image)
 
                 extrinsics_list.append(torch.from_numpy(extrinsics.copy()))
