@@ -377,6 +377,47 @@ def compute_balanced_depth_loss(
     }
 
 
+def get_last_frame_view_indices(
+    sequence_len: int,
+    n_time_steps: int,
+    cam_num: int,
+    device: torch.device,
+) -> torch.Tensor:
+    expected_sequence_len = n_time_steps * cam_num
+    if sequence_len != expected_sequence_len:
+        raise ValueError(
+            f"Sequence length {sequence_len} does not match "
+            f"n_time_steps({n_time_steps}) * cam_num({cam_num}) = {expected_sequence_len}"
+        )
+    start = (n_time_steps - 1) * cam_num
+    return torch.arange(start, start + cam_num, device=device, dtype=torch.long)
+
+
+def select_last_frame_views(
+    tensor: torch.Tensor,
+    n_time_steps: int,
+    cam_num: int,
+) -> torch.Tensor:
+    if tensor.ndim < 2:
+        raise ValueError(f"Expected a tensor with a sequence dimension, got {tuple(tensor.shape)}")
+    view_indices = get_last_frame_view_indices(
+        tensor.shape[1],
+        n_time_steps=n_time_steps,
+        cam_num=cam_num,
+        device=tensor.device,
+    )
+    return tensor.index_select(1, view_indices)
+
+
+def intrinsics_to_fov(intrinsics: torch.Tensor, image_size_hw: Tuple[int, int]) -> torch.Tensor:
+    image_h, image_w = image_size_hw
+    fx = intrinsics[..., 0, 0].clamp_min(1e-6)
+    fy = intrinsics[..., 1, 1].clamp_min(1e-6)
+    fov_h = 2.0 * torch.atan((image_h * 0.5) / fy)
+    fov_w = 2.0 * torch.atan((image_w * 0.5) / fx)
+    return torch.stack([fov_h, fov_w], dim=-1)
+
+
 def compute_losses(
     predictions: Dict[str, torch.Tensor],
     batch: Dict[str, torch.Tensor],
@@ -407,12 +448,14 @@ def compute_losses(
         with torch.amp.autocast(device_type=batch["images"].device.type, enabled=False):
             pred_depth = (predictions["depth"].squeeze(-1) * depth_pred_scale).float()
             gt_depth = build_depth_supervision_target(batch, depth_supervision_source)
+            pred_depth = select_last_frame_views(pred_depth, n_time_steps=n_time_steps, cam_num=cam_num)
+            gt_depth = select_last_frame_views(gt_depth, n_time_steps=n_time_steps, cam_num=cam_num)
             valid_mask = (gt_depth > 0.0) & (gt_depth < 655.0)
             depth_loss, depth_stats = compute_balanced_depth_loss(
                 pred_depth,
                 gt_depth,
                 valid_mask,
-                n_time_steps=n_time_steps,
+                n_time_steps=1,
                 cam_num=cam_num,
                 depth_loss_type=depth_loss_type,
             )
@@ -428,19 +471,67 @@ def compute_losses(
             }
         )
 
-    if "seq_enc_list" in predictions and "intrinsics" in batch and camera_weight > 0:
+    if ("seq_enc_list" in predictions or "extrinsic" in predictions) and "intrinsics" in batch and camera_weight > 0:
         image_hw = batch["images"].shape[-2:]
+        gt_extrinsics = select_last_frame_views(normalized_extrinsics, n_time_steps=n_time_steps, cam_num=cam_num)
+        gt_intrinsics = select_last_frame_views(batch["intrinsics"], n_time_steps=n_time_steps, cam_num=cam_num)
         gt_pose_enc = extri_intri_to_pose_encoding(
-            normalized_extrinsics,
-            batch["intrinsics"],
+            gt_extrinsics,
+            gt_intrinsics,
             image_size_hw=image_hw,
         )
-        pred_pose_enc = predictions["seq_enc_list"][-1]
-        pred_extrinsics, _ = pose_encoding_to_extri_intri(pred_pose_enc, image_size_hw=image_hw)
+        if "extrinsic" in predictions:
+            pred_extrinsics = select_last_frame_views(
+                predictions["extrinsic"].float(),
+                n_time_steps=n_time_steps,
+                cam_num=cam_num,
+            )
+            if "intrinsic" in predictions:
+                pred_intrinsics = select_last_frame_views(
+                    predictions["intrinsic"].float(),
+                    n_time_steps=n_time_steps,
+                    cam_num=cam_num,
+                )
+                pred_fov = intrinsics_to_fov(pred_intrinsics, image_hw)
+            else:
+                pred_pose_enc = predictions["seq_enc_list"][-1]
+                if pred_pose_enc.shape[1] != cam_num:
+                    pred_pose_enc = select_last_frame_views(
+                        pred_pose_enc,
+                        n_time_steps=n_time_steps,
+                        cam_num=cam_num,
+                    )
+                pred_fov = pred_pose_enc[..., 7:]
+        else:
+            pred_pose_enc = predictions["seq_enc_list"][-1]
+            pred_extrinsics, _ = pose_encoding_to_extri_intri(pred_pose_enc, image_size_hw=image_hw)
+            if pred_extrinsics.shape[1] != cam_num:
+                pred_extrinsics = select_last_frame_views(
+                    pred_extrinsics,
+                    n_time_steps=n_time_steps,
+                    cam_num=cam_num,
+                )
+                pred_pose_enc = select_last_frame_views(
+                    pred_pose_enc,
+                    n_time_steps=n_time_steps,
+                    cam_num=cam_num,
+                )
+            pred_fov = pred_pose_enc[..., 7:]
 
-        pose_translation_loss = F.l1_loss(pred_extrinsics[..., :3, 3], normalized_extrinsics[..., :3, 3])
-        pose_rotation_loss = F.l1_loss(pred_extrinsics[..., :3, :3], normalized_extrinsics[..., :3, :3])
-        pose_fov_loss = F.l1_loss(pred_pose_enc[..., 7:], gt_pose_enc[..., 7:])
+        if pred_extrinsics.shape != gt_extrinsics.shape:
+            raise ValueError(
+                f"Camera extrinsic supervision shape mismatch: "
+                f"pred {tuple(pred_extrinsics.shape)} vs gt {tuple(gt_extrinsics.shape)}"
+            )
+        if pred_fov.shape != gt_pose_enc[..., 7:].shape:
+            raise ValueError(
+                f"Camera FOV supervision shape mismatch: "
+                f"pred {tuple(pred_fov.shape)} vs gt {tuple(gt_pose_enc[..., 7:].shape)}"
+            )
+
+        pose_translation_loss = F.l1_loss(pred_extrinsics[..., :3, 3], gt_extrinsics[..., :3, 3])
+        pose_rotation_loss = F.l1_loss(pred_extrinsics[..., :3, :3], gt_extrinsics[..., :3, :3])
+        pose_fov_loss = F.l1_loss(pred_fov, gt_pose_enc[..., 7:])
 
         camera_loss = (
             pose_translation_weight * pose_translation_loss

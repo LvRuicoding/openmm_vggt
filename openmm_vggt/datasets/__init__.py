@@ -1,5 +1,6 @@
 from .kitti_depth_stereo import KITTIDepthCompletionStereoDataset
 from .kitti_semantic_occ import KITTISemanticOccupancyDataset
+from .kitti_semantic_occ_depth import KITTISemanticOccupancyDepthDataset
 from .vkitti_depth_stereo import VKITTIDepthStereoDataset
 
 try:
@@ -12,6 +13,7 @@ except Exception:  # optional dependency path for DGP/DDAD
 __all__ = [
     "KITTIDepthCompletionStereoDataset",
     "KITTISemanticOccupancyDataset",
+    "KITTISemanticOccupancyDepthDataset",
     "VKITTIDepthStereoDataset",
 ]
 
