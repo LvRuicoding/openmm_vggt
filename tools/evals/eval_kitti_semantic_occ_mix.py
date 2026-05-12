@@ -69,6 +69,21 @@ def log(msg: str) -> None:
         print(msg, flush=True)
 
 
+def align_occupancy_targets_to_logits(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if logits.shape[0] == target.shape[0]:
+        return target, valid_mask
+    if target.shape[0] <= 0 or logits.shape[0] % target.shape[0] != 0:
+        raise ValueError(
+            f"Occupancy batch mismatch: logits batch={logits.shape[0]}, target batch={target.shape[0]}"
+        )
+    repeat = logits.shape[0] // target.shape[0]
+    return target.repeat_interleave(repeat, dim=0), valid_mask.repeat_interleave(repeat, dim=0)
+
+
 def setup_distributed() -> torch.device:
     if not torch.cuda.is_available():
         return torch.device("cpu")
@@ -296,10 +311,15 @@ def evaluate(model: nn.Module, data_loader: DataLoader, device: torch.device, nu
                 preds = model(batch["images"], others=build_model_others(batch, norm_ext))
             if "occupancy_logits" not in preds:
                 raise RuntimeError("Model did not return `occupancy_logits`.")
-            local.update(
-                preds["occupancy_logits"].float(),
+            occ_target, occ_valid_mask = align_occupancy_targets_to_logits(
+                preds["occupancy_logits"],
                 batch["occupancy_target"].long(),
                 batch["occupancy_valid_mask"].bool(),
+            )
+            local.update(
+                preds["occupancy_logits"].float(),
+                occ_target,
+                occ_valid_mask,
             )
 
     return local.reduce(device)

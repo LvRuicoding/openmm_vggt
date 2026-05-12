@@ -57,6 +57,7 @@ train_dataset = dict(
     dense_voxel_root=dense_voxel_root,
     require_dense_voxel_target=True,
     occupancy_cache_dir="/tmp/openmm_vggt_kitti_semantic_occ_cache_train",
+    frustum_size=4,
 )
 
 train_dataloader = dict(
@@ -80,6 +81,7 @@ val_dataset = dict(
     dense_voxel_root=dense_voxel_root,
     require_dense_voxel_target=True,
     occupancy_cache_dir="/tmp/openmm_vggt_kitti_semantic_occ_cache_val",
+    frustum_size=4,
 )
 
 val_dataloader = dict(
@@ -134,6 +136,7 @@ occupancy_class_weights = [
 ]
 sem_scal_weight = 1.0
 geo_scal_weight = 1.0
+frustum_proportion_weight = 1.0
 context_prior_weight = 1.0
 
 checkpoint = "/home/dataset-local/lr/code/openmm_vggt/ckpt/checkpoint_5.pt"

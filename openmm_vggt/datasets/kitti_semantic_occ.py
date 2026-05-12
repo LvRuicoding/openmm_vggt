@@ -294,6 +294,7 @@ class KITTISemanticOccupancyDataset(Dataset):
         dense_voxel_root: Optional[str] = None,
         require_dense_voxel_target: bool = False,
         occupancy_cache_dir: Optional[str] = None,
+        frustum_size: int = 0,
     ) -> None:
         assert n_time_steps >= 1
         assert image_size[0] % 14 == 0 and image_size[1] % 14 == 0
@@ -318,6 +319,9 @@ class KITTISemanticOccupancyDataset(Dataset):
         self.ignore_index = 255
         self.dense_voxel_root = Path(dense_voxel_root) if dense_voxel_root is not None else None
         self.require_dense_voxel_target = bool(require_dense_voxel_target)
+        self.frustum_size = int(frustum_size)
+        if self.frustum_size < 0:
+            raise ValueError(f"frustum_size must be >= 0, got {self.frustum_size}")
         if self.require_dense_voxel_target and self.dense_voxel_root is None:
             raise ValueError("require_dense_voxel_target=True requires dense_voxel_root to be set.")
 
@@ -466,6 +470,14 @@ class KITTISemanticOccupancyDataset(Dataset):
         source_tag = "dense_v1" if self.dense_voxel_root is not None else "ssc_free_v1"
         return self.occupancy_cache_dir / f"{sequence_id}_{frame_id}_{grid_tag}_{source_tag}.npz"
 
+    def _frustum_cache_path(self, sequence_id: str, frame_id: str) -> Path:
+        grid_tag = f"{self.grid_size[0]}_{self.grid_size[1]}_{self.grid_size[2]}"
+        image_tag = f"{self.image_size[0]}_{self.image_size[1]}"
+        source_tag = "dense_v1" if self.dense_voxel_root is not None else "ssc_free_v1"
+        return self.occupancy_cache_dir / (
+            f"{sequence_id}_{frame_id}_{grid_tag}_{image_tag}_{source_tag}_frustum_{self.frustum_size}.npz"
+        )
+
     @staticmethod
     def _unpack_voxel_mask(path: Path, expected_size: int) -> np.ndarray:
         packed = np.fromfile(path, dtype=np.uint8)
@@ -573,6 +585,105 @@ class KITTISemanticOccupancyDataset(Dataset):
         np.savez_compressed(cache_path, target=target, valid_mask=valid_mask)
         return torch.from_numpy(target.astype(np.int64)), torch.from_numpy(valid_mask.astype(bool))
 
+    def _voxel_centers_lidar(self) -> np.ndarray:
+        grid_x, grid_y, grid_z = self.grid_size.tolist()
+        xs, ys, zs = np.meshgrid(
+            np.arange(grid_x, dtype=np.float32),
+            np.arange(grid_y, dtype=np.float32),
+            np.arange(grid_z, dtype=np.float32),
+            indexing="ij",
+        )
+        coords = np.stack((xs, ys, zs), axis=-1).reshape(-1, 3)
+        return self.point_cloud_range[:3] + (coords + 0.5) * self.voxel_size
+
+    @staticmethod
+    def _project_lidar_centers_to_image(
+        centers_lidar: np.ndarray,
+        intrinsics: np.ndarray,
+        extrinsics_world_to_camera: np.ndarray,
+        lidar_to_world: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        centers_h = np.concatenate(
+            [centers_lidar.astype(np.float32), np.ones((centers_lidar.shape[0], 1), dtype=np.float32)],
+            axis=1,
+        )
+        centers_world = (lidar_to_world.astype(np.float32) @ centers_h.T).T
+        xyz_camera = (extrinsics_world_to_camera.astype(np.float32) @ centers_world.T).T
+
+        z = xyz_camera[:, 2]
+        safe_z = np.maximum(z, 1e-5)
+        u = intrinsics[0, 0] * xyz_camera[:, 0] / safe_z + intrinsics[0, 2]
+        v = intrinsics[1, 1] * xyz_camera[:, 1] / safe_z + intrinsics[1, 2]
+        return u, v, z
+
+    def _build_frustum_targets(
+        self,
+        record: _SequenceRecord,
+        frame_id: str,
+        occupancy_target: torch.Tensor,
+        occupancy_valid_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cache_path = self._frustum_cache_path(record.sequence_id, frame_id)
+        if cache_path.is_file():
+            cached = np.load(cache_path)
+            return (
+                torch.from_numpy(cached["frustums_masks"].astype(bool)),
+                torch.from_numpy(cached["frustums_class_dists"].astype(np.float32)),
+            )
+
+        target = occupancy_target.numpy()
+        valid_target = occupancy_valid_mask.numpy().astype(bool) & (target != self.ignore_index)
+        flat_target = target.reshape(-1)
+        flat_valid_target = valid_target.reshape(-1)
+        centers_lidar = self._voxel_centers_lidar()
+        image_h, image_w = self.image_size
+        num_frustums = self.frustum_size * self.frustum_size
+
+        frustum_masks = np.zeros((2, num_frustums, *self.grid_size.tolist()), dtype=bool)
+        frustum_class_dists = np.zeros((2, num_frustums, self.num_classes), dtype=np.float32)
+        lidar_to_world = record.world_velodyne_poses[frame_id]
+        camera_specs = (
+            (record.intrinsics_02, record.extrinsics_02[frame_id]),
+            (record.intrinsics_03, record.extrinsics_03[frame_id]),
+        )
+
+        for cam_idx, (intrinsics_raw, extrinsics) in enumerate(camera_specs):
+            intrinsics = resize_intrinsics(intrinsics_raw, orig_hw=record.raw_hw, out_hw=self.image_size)
+            pix_x, pix_y, pix_z = self._project_lidar_centers_to_image(
+                centers_lidar,
+                intrinsics=intrinsics,
+                extrinsics_world_to_camera=extrinsics,
+                lidar_to_world=lidar_to_world,
+            )
+            in_image = (
+                (pix_z > 0)
+                & (pix_x >= 0)
+                & (pix_x < image_w)
+                & (pix_y >= 0)
+                & (pix_y < image_h)
+                & flat_valid_target
+            )
+            frustum_idx = 0
+            for y_idx in range(self.frustum_size):
+                y0 = y_idx * image_h / self.frustum_size
+                y1 = (y_idx + 1) * image_h / self.frustum_size
+                for x_idx in range(self.frustum_size):
+                    x0 = x_idx * image_w / self.frustum_size
+                    x1 = (x_idx + 1) * image_w / self.frustum_size
+                    mask_flat = in_image & (pix_x >= x0) & (pix_x < x1) & (pix_y >= y0) & (pix_y < y1)
+                    frustum_masks[cam_idx, frustum_idx] = mask_flat.reshape(*self.grid_size.tolist())
+                    if mask_flat.any():
+                        counts = np.bincount(flat_target[mask_flat].astype(np.int64), minlength=self.num_classes)
+                        frustum_class_dists[cam_idx, frustum_idx] = counts[: self.num_classes].astype(np.float32)
+                    frustum_idx += 1
+
+        np.savez_compressed(
+            cache_path,
+            frustums_masks=frustum_masks,
+            frustums_class_dists=frustum_class_dists,
+        )
+        return torch.from_numpy(frustum_masks), torch.from_numpy(frustum_class_dists)
+
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         record_idx, last_idx = self.samples[index]
         record = self.records[record_idx]
@@ -622,7 +733,7 @@ class KITTISemanticOccupancyDataset(Dataset):
         target_frame_id = time_frame_ids[-1]
         occupancy_target, occupancy_valid_mask = self._build_occupancy_target(record, target_frame_id)
 
-        return {
+        sample = {
             "images": torch.stack(images_list, dim=0),
             "extrinsics": torch.stack(extrinsics_list, dim=0),
             "intrinsics": torch.stack(intrinsics_list, dim=0),
@@ -633,3 +744,13 @@ class KITTISemanticOccupancyDataset(Dataset):
             "occupancy_target": occupancy_target,
             "occupancy_valid_mask": occupancy_valid_mask,
         }
+        if self.frustum_size > 0:
+            frustums_masks, frustums_class_dists = self._build_frustum_targets(
+                record,
+                target_frame_id,
+                occupancy_target=occupancy_target,
+                occupancy_valid_mask=occupancy_valid_mask,
+            )
+            sample["frustums_masks"] = frustums_masks
+            sample["frustums_class_dists"] = frustums_class_dists
+        return sample

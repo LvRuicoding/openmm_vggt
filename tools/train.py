@@ -197,6 +197,33 @@ def sem_scal_loss(pred: torch.Tensor, target: torch.Tensor, ignore_index: int = 
     return loss / float(count)
 
 
+def frustum_proportion_loss(
+    pred: torch.Tensor,
+    frustums_masks: torch.Tensor,
+    frustums_class_dists: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    pred_prob = F.softmax(pred, dim=1)
+    batch_size, num_classes = pred_prob.shape[:2]
+    pred_prob = pred_prob.reshape(batch_size, num_classes, -1)
+    frustums_masks = frustums_masks.reshape(batch_size, frustums_masks.shape[1], -1).to(dtype=pred_prob.dtype)
+    frustums_class_dists = frustums_class_dists.to(device=pred.device, dtype=pred_prob.dtype)
+
+    cum_prob = torch.einsum("bcv,bfv->fc", pred_prob, frustums_masks)
+    target_counts = frustums_class_dists.sum(dim=0)
+    total_prob = cum_prob.sum(dim=1, keepdim=True)
+    total_counts = target_counts.sum(dim=1, keepdim=True)
+    valid_frustums = (total_prob.squeeze(1) > eps) & (total_counts.squeeze(1) > 0)
+    if not valid_frustums.any():
+        return pred.sum() * 0.0
+
+    pred_proportion = cum_prob / total_prob.clamp_min(eps)
+    target_proportion = target_counts / total_counts.clamp_min(eps)
+    nonzero = (target_proportion > 0) & valid_frustums[:, None]
+    kl = target_proportion * (target_proportion.clamp_min(eps).log() - pred_proportion.clamp_min(eps).log())
+    return kl[nonzero].sum() / valid_frustums.sum().to(dtype=kl.dtype)
+
+
 def downsample_target_object_priority(
     target: torch.Tensor,
     output_shape: Tuple[int, int, int],
@@ -365,6 +392,7 @@ def compute_losses(
     occupancy_num_classes: int = 20,
     sem_scal_weight: float = 0.0,
     geo_scal_weight: float = 0.0,
+    frustum_proportion_weight: float = 0.0,
     context_prior_weight: float = 0.0,
     depth_pred_scale: float = 1.0,
     depth_supervision_source: str = "batch_depth",
@@ -432,7 +460,12 @@ def compute_losses(
 
     if "occupancy_logits" in predictions and "occupancy_target" in batch and occupancy_weight > 0:
         occ_logits = predictions["occupancy_logits"].float()
-        occ_target = batch["occupancy_target"].long().masked_fill(~batch["occupancy_valid_mask"].bool(), occupancy_ignore_index)
+        occ_target_raw, occ_valid_mask = align_occupancy_targets_to_logits(
+            occ_logits,
+            batch["occupancy_target"].long(),
+            batch["occupancy_valid_mask"].bool(),
+        )
+        occ_target = occ_target_raw.masked_fill(~occ_valid_mask, occupancy_ignore_index)
         occ_loss = F.cross_entropy(
             occ_logits,
             occ_target,
@@ -449,6 +482,19 @@ def compute_losses(
             geo_loss = geo_scal_loss(occ_logits, occ_target, ignore_index=occupancy_ignore_index)
             total = total + geo_scal_weight * geo_loss
             extra_occ_metrics["geo_scal_loss"] = float(geo_loss.detach().cpu())
+        if (
+            frustum_proportion_weight > 0
+            and "frustums_masks" in batch
+            and "frustums_class_dists" in batch
+        ):
+            frustums_masks, frustums_class_dists = align_frustum_targets_to_logits(
+                occ_logits,
+                batch["frustums_masks"].bool(),
+                batch["frustums_class_dists"].float(),
+            )
+            fp_loss = frustum_proportion_loss(occ_logits, frustums_masks, frustums_class_dists)
+            total = total + frustum_proportion_weight * fp_loss
+            extra_occ_metrics["frustum_proportion_loss"] = float(fp_loss.detach().cpu())
         if context_prior_weight > 0 and "context_prior_logits" in predictions:
             cp_logits = predictions["context_prior_logits"].float()
             _, n_relations, context_count, voxel_count = cp_logits.shape
@@ -497,6 +543,52 @@ def compute_losses(
             }
         )
     return total, metrics
+
+
+def align_occupancy_targets_to_logits(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if logits.shape[0] == target.shape[0]:
+        return target, valid_mask
+    if target.shape[0] <= 0 or logits.shape[0] % target.shape[0] != 0:
+        raise ValueError(
+            f"Occupancy batch mismatch: logits batch={logits.shape[0]}, target batch={target.shape[0]}"
+        )
+    repeat = logits.shape[0] // target.shape[0]
+    target = target.repeat_interleave(repeat, dim=0)
+    if valid_mask is not None:
+        valid_mask = valid_mask.repeat_interleave(repeat, dim=0)
+    return target, valid_mask
+
+
+def align_frustum_targets_to_logits(
+    logits: torch.Tensor,
+    frustums_masks: torch.Tensor,
+    frustums_class_dists: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    logits_batch = logits.shape[0]
+    if frustums_masks.shape[0] == logits_batch and frustums_masks.ndim == 5:
+        return frustums_masks.to(device=logits.device), frustums_class_dists.to(device=logits.device)
+
+    if frustums_masks.ndim == 6 and frustums_masks.shape[0] * frustums_masks.shape[1] == logits_batch:
+        return (
+            frustums_masks.reshape(logits_batch, *frustums_masks.shape[2:]).to(device=logits.device),
+            frustums_class_dists.reshape(logits_batch, *frustums_class_dists.shape[2:]).to(device=logits.device),
+        )
+
+    if frustums_masks.shape[0] > 0 and logits_batch % frustums_masks.shape[0] == 0:
+        repeat = logits_batch // frustums_masks.shape[0]
+        return (
+            frustums_masks.repeat_interleave(repeat, dim=0).to(device=logits.device),
+            frustums_class_dists.repeat_interleave(repeat, dim=0).to(device=logits.device),
+        )
+
+    raise ValueError(
+        "Frustum target batch mismatch: "
+        f"logits batch={logits_batch}, frustums_masks shape={tuple(frustums_masks.shape)}"
+    )
 
 
 def accumulate_occupancy_stats(
@@ -797,6 +889,7 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
         occupancy_class_weights = torch.tensor(occupancy_class_weights, dtype=torch.float32, device=device)
     sem_scal_weight = float(cfg.get("sem_scal_weight", 0.0))
     geo_scal_weight = float(cfg.get("geo_scal_weight", 0.0))
+    frustum_proportion_weight = float(cfg.get("frustum_proportion_weight", 0.0))
     context_prior_weight = float(cfg.get("context_prior_weight", 0.0))
     maximize_metric = occupancy_weight > 0
     best_val = -float("inf") if maximize_metric else float("inf")
@@ -883,6 +976,7 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
                 occupancy_num_classes=occupancy_num_classes,
                 sem_scal_weight=sem_scal_weight,
                 geo_scal_weight=geo_scal_weight,
+                frustum_proportion_weight=frustum_proportion_weight,
                 context_prior_weight=context_prior_weight,
                 depth_pred_scale=cfg.get("depth_pred_scale", 1.0),
                 depth_supervision_source=cfg.get("depth_supervision_source", "batch_depth"),
@@ -988,6 +1082,7 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
                         occupancy_num_classes=occupancy_num_classes,
                         sem_scal_weight=sem_scal_weight,
                         geo_scal_weight=geo_scal_weight,
+                        frustum_proportion_weight=frustum_proportion_weight,
                         context_prior_weight=context_prior_weight,
                         depth_pred_scale=cfg.get("depth_pred_scale", 1.0),
                         depth_supervision_source=cfg.get("depth_supervision_source", "batch_depth"),
@@ -999,12 +1094,17 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
                         val_sum[key] = val_sum.get(key, 0.0) + value
                     val_count += 1
                     if "occupancy_logits" in predictions:
-                        occ_target = batch["occupancy_target"].long().masked_fill(~batch["occupancy_valid_mask"].bool(), occupancy_ignore_index)
+                        occ_target_raw, occ_valid_mask = align_occupancy_targets_to_logits(
+                            predictions["occupancy_logits"],
+                            batch["occupancy_target"].long(),
+                            batch["occupancy_valid_mask"].bool(),
+                        )
+                        occ_target = occ_target_raw.masked_fill(~occ_valid_mask, occupancy_ignore_index)
                         accumulate_occupancy_stats(
                             val_occ_stats,
                             predictions["occupancy_logits"],
                             occ_target,
-                            batch["occupancy_valid_mask"],
+                            occ_valid_mask,
                             occupancy_num_classes,
                             occupancy_ignore_index,
                         )

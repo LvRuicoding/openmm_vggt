@@ -4,7 +4,6 @@ from typing import List, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class _Bottleneck3D(nn.Module):
@@ -456,17 +455,19 @@ class MonoSceneOccupancyHead(nn.Module):
         centers = self.point_cloud_range[:3].to(device=device, dtype=dtype) + (grid + 0.5) * coarse_voxel_size
         return centers.reshape(-1, 3)
 
-    def _project_centers(
+    def _project_centers_to_patches(
         self,
         centers_lidar: torch.Tensor,
         intrinsics: torch.Tensor,
         camera_to_world: torch.Tensor,
         lidar_to_world: torch.Tensor,
         image_hw: Tuple[int, int],
+        patch_hw: Tuple[int, int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, view_count = intrinsics.shape[:2]
         num_voxels = centers_lidar.shape[0]
         image_h, image_w = image_hw
+        patch_h, patch_w = patch_hw
 
         centers_h = torch.cat([centers_lidar, torch.ones_like(centers_lidar[..., :1])], dim=-1)
         centers_world = torch.matmul(lidar_to_world[:, None, None, :, :], centers_h.view(1, 1, num_voxels, 4, 1)).squeeze(-1)
@@ -478,7 +479,8 @@ class MonoSceneOccupancyHead(nn.Module):
 
         x = xyz_cam[..., 0]
         y = xyz_cam[..., 1]
-        z = xyz_cam[..., 2].clamp(min=1e-5)
+        z_raw = xyz_cam[..., 2]
+        z = z_raw.clamp(min=1e-5)
 
         fx = intrinsics[..., 0, 0][..., None]
         fy = intrinsics[..., 1, 1][..., None]
@@ -487,11 +489,31 @@ class MonoSceneOccupancyHead(nn.Module):
 
         u = fx * x / z + cx
         v = fy * y / z + cy
-        valid = (z > 0) & (u >= 0) & (u <= image_w - 1) & (v >= 0) & (v <= image_h - 1)
+        valid = (z_raw > 0) & (u >= 0) & (u <= image_w - 1) & (v >= 0) & (v <= image_h - 1)
 
-        u_norm = (u / max(image_w - 1, 1)) * 2 - 1
-        v_norm = (v / max(image_h - 1, 1)) * 2 - 1
-        return torch.stack([u_norm, v_norm], dim=-1), valid
+        patch_x = torch.div(u, self.patch_size, rounding_mode="floor").to(torch.long)
+        patch_y = torch.div(v, self.patch_size, rounding_mode="floor").to(torch.long)
+        valid = valid & (patch_x >= 0) & (patch_x < patch_w) & (patch_y >= 0) & (patch_y < patch_h)
+        patch_index = patch_y * patch_w + patch_x
+        return patch_index, valid
+
+    @staticmethod
+    def _flosp_gather(
+        feat_map: torch.Tensor,
+        patch_index: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_views, channels, patch_h, patch_w = feat_map.shape
+        patch_count = patch_h * patch_w
+        src = feat_map.reshape(batch_views, channels, patch_count)
+        zeros = src.new_zeros((batch_views, channels, 1))
+        src = torch.cat([src, zeros], dim=2)
+
+        flat_index = patch_index.reshape(batch_views, -1).clone()
+        flat_valid = valid.reshape(batch_views, -1)
+        flat_index[~flat_valid] = patch_count
+        gather_index = flat_index[:, None, :].expand(-1, channels, -1)
+        return torch.gather(src, 2, gather_index)
 
     def forward(
         self,
@@ -509,6 +531,11 @@ class MonoSceneOccupancyHead(nn.Module):
             raise ValueError(f"Expected tokens with shape [B, S, N, D], got {tuple(tokens.shape)}")
 
         batch_size, view_count, patch_count, token_dim = tokens.shape
+        if view_count != 1:
+            raise ValueError(
+                "MonoSceneOccupancyHead expects single-view samples. "
+                f"Flatten camera views into the batch dimension before calling it; got view_count={view_count}."
+            )
         image_h, image_w = images.shape[-2:]
         patch_h = image_h // self.patch_size
         patch_w = image_w // self.patch_size
@@ -546,29 +573,24 @@ class MonoSceneOccupancyHead(nn.Module):
             centers_chunk = centers[start:end]
             chunk_voxels = end - start
 
-            grid, valid = self._project_centers(
+            patch_index, valid = self._project_centers_to_patches(
                 centers_chunk,
                 intrinsics=intrinsics,
                 camera_to_world=camera_to_world,
                 lidar_to_world=lidar_to_world,
                 image_hw=(image_h, image_w),
+                patch_hw=(patch_h, patch_w),
             )
-            grid = grid.reshape(batch_size * view_count, chunk_voxels, 1, 2)
-            valid = valid.to(dtype=tokens.dtype).unsqueeze(-1)
-            denom = valid.sum(dim=1).clamp_min(1.0)
 
             layer_feats = []
             for feat_map, layer_proj in zip(feat_maps, self.layer_proj):
-                sampled = F.grid_sample(
+                sampled = self._flosp_gather(
                     feat_map,
-                    grid,
-                    mode="bilinear",
-                    padding_mode="zeros",
-                    align_corners=True,
+                    patch_index=patch_index,
+                    valid=valid,
                 )
-                sampled = sampled.squeeze(-1).permute(0, 2, 1).reshape(batch_size, view_count, chunk_voxels, token_dim)
-                sampled = sampled * valid
-                layer_feats.append(layer_proj(sampled.sum(dim=1) / denom))
+                sampled = sampled.permute(0, 2, 1).reshape(batch_size, view_count, chunk_voxels, token_dim)
+                layer_feats.append(layer_proj(sampled.squeeze(1)))
 
             voxel_feat = self.layer_fuse(torch.cat(layer_feats, dim=-1))
             fused = self.fuse(
