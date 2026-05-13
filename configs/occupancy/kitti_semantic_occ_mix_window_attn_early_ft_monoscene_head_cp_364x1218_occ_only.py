@@ -1,8 +1,7 @@
-# mmengine-style config for KITTI semantic voxel occupancy + depth/camera fine-tuning
+# mmengine-style config for KITTI semantic voxel occupancy-only fine-tuning
 
 semantic_root = "/home/dataset-local/lr/code/openmm_vggt/data/kitti_semantic"
 raw_root = "/home/dataset-local/lr/code/openmm_vggt/data/kitti_raw"
-depth_root = "/home/dataset-local/lr/code/openmm_vggt/data/OpenDataLab___KITTI_depth_completion"
 dense_voxel_root = "/home/dataset-local/lr/code/openmm_vggt/data/odemetry_voxels"
 
 image_size = (364, 1218)
@@ -18,9 +17,9 @@ model = dict(
     img_size=518,
     patch_size=14,
     embed_dim=1024,
-    enable_camera=True,
+    enable_camera=False,
     enable_point=False,
-    enable_depth=True,
+    enable_depth=False,
     enable_track=False,
     cam_num=2,
     voxel_size=fusion_voxel_size,
@@ -38,18 +37,16 @@ model = dict(
         point_cloud_range=occ_point_cloud_range,
         num_classes=20,
         feature=64,
-        project_scale=2,
+        project_scale=1,
         context_prior=True,
         n_relations=4,
     ),
 )
 
 train_dataset = dict(
-    type="KITTISemanticOccupancyDepthDataset",
+    type="KITTISemanticOccupancyDataset",
     semantic_root=semantic_root,
     raw_root=raw_root,
-    depth_root=depth_root,
-    require_depth_gt=True,
     split="train",
     n_time_steps=n_time_steps,
     stride=stride,
@@ -60,7 +57,7 @@ train_dataset = dict(
     point_cloud_range=occ_point_cloud_range,
     dense_voxel_root=dense_voxel_root,
     require_dense_voxel_target=True,
-    occupancy_cache_dir="/tmp/openmm_vggt_kitti_semantic_occ_depth_camera_cache_train",
+    occupancy_cache_dir="/tmp/openmm_vggt_kitti_semantic_occ_only_cache_train",
     frustum_size=4,
     color_jitter=(0.4, 0.4, 0.4),
 )
@@ -72,11 +69,9 @@ train_dataloader = dict(
 )
 
 val_dataset = dict(
-    type="KITTISemanticOccupancyDepthDataset",
+    type="KITTISemanticOccupancyDataset",
     semantic_root=semantic_root,
     raw_root=raw_root,
-    depth_root=depth_root,
-    require_depth_gt=True,
     split="val",
     n_time_steps=n_time_steps,
     stride=stride,
@@ -87,7 +82,7 @@ val_dataset = dict(
     point_cloud_range=occ_point_cloud_range,
     dense_voxel_root=dense_voxel_root,
     require_dense_voxel_target=True,
-    occupancy_cache_dir="/tmp/openmm_vggt_kitti_semantic_occ_depth_camera_cache_val",
+    occupancy_cache_dir="/tmp/openmm_vggt_kitti_semantic_occ_only_cache_val",
     frustum_size=4,
 )
 
@@ -110,11 +105,11 @@ scheduler = dict(
     eta_min=2e-6,
 )
 
-depth_weight = 1.0
-camera_weight = 1.0
-pose_translation_weight = 1.0
-pose_rotation_weight = 1.0
-pose_fov_weight = 1.0
+depth_weight = 0.0
+camera_weight = 0.0
+pose_translation_weight = 0.0
+pose_rotation_weight = 0.0
+pose_fov_weight = 0.0
 depth_pred_scale = 20.0
 
 occupancy_weight = 1.0
@@ -148,7 +143,7 @@ frustum_proportion_weight = 1.0
 context_prior_weight = 1.0
 
 checkpoint = "/home/dataset-local/lr/code/openmm_vggt/ckpt/checkpoint_5.pt"
-output_dir = "/home/dataset-local/lr/code/openmm_vggt/trainoutput/kitti_semantic_occ_mix_window_attn_early_ft_monoscene_head_cp_364x1218_depth_camera"
+output_dir = "/home/dataset-local/lr/code/openmm_vggt/trainoutput/kitti_semantic_occ_mix_window_attn_early_ft_monoscene_head_cp_364x1218_occ_only"
 
 epochs = 8
 grad_clip = 1.0

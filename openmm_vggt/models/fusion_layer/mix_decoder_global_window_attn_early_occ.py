@@ -76,6 +76,21 @@ class mix_decoder_global_window_attn_early_occ(mix_decoder_global_window_attn_ea
                 **occupancy_head,
             )
 
+    def _last_frame_time_major_indices(
+        self,
+        sequence_length: int,
+        frame_count: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        expected_sequence_length = frame_count * self.cam_num
+        if sequence_length != expected_sequence_length:
+            raise ValueError(
+                f"Sequence length {sequence_length} does not match "
+                f"frame_count({frame_count}) * cam_num({self.cam_num}) = {expected_sequence_length}"
+            )
+        start = (frame_count - 1) * self.cam_num
+        return torch.arange(start, start + self.cam_num, device=device, dtype=torch.long)
+
     def _forward_from_aggregator_outputs(
         self,
         aggregated_tokens_list,
@@ -193,34 +208,22 @@ class mix_decoder_global_window_attn_early_occ(mix_decoder_global_window_attn_ea
                 predictions["depth_conf"] = self._camera_major_to_time_major(depth_conf, batch_size, frame_count)
 
             if self.occupancy_head is not None and others is not None:
-                occ_intrinsics = self._time_major_to_camera_major(
-                    others["intrinsics"],
-                    batch_size,
-                    frame_count,
-                )
-                occ_camera_to_world = self._time_major_to_camera_major(
-                    others["camera_to_world"],
-                    batch_size,
-                    frame_count,
+                view_indices = self._last_frame_time_major_indices(
+                    sequence_length=sequence_length,
+                    frame_count=frame_count,
+                    device=others["intrinsics"].device,
                 )
                 last_frame_lidar_to_world = others["lidar_to_world"][:, -1, :, :]
-                view_indices = torch.arange(
-                    frame_count - 1,
-                    self.cam_num * frame_count,
-                    frame_count,
-                    device=occ_intrinsics.device,
-                    dtype=torch.long,
-                )
                 token_view_indices = view_indices.to(agg_layers_depths_tokens_list[0].device)
                 occ_depth_tokens = [
-                    layer_tokens.index_select(1, token_view_indices)
+                    self._camera_major_to_time_major(layer_tokens, batch_size, frame_count).index_select(1, token_view_indices)
                     for layer_tokens in agg_layers_depths_tokens_list
                 ]
                 occ_outputs = self.occupancy_head(
                     aggregated_tokens_list=occ_depth_tokens,
-                    images=images,
-                    intrinsics=occ_intrinsics.index_select(1, view_indices),
-                    camera_to_world=occ_camera_to_world.index_select(1, view_indices),
+                    images=images_time_major,
+                    intrinsics=others["intrinsics"].index_select(1, view_indices),
+                    camera_to_world=others["camera_to_world"].index_select(1, view_indices),
                     lidar_to_world=last_frame_lidar_to_world,
                 )
 

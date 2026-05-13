@@ -788,6 +788,38 @@ def load_model_from_checkpoint(
     return " | ".join(message_parts)
 
 
+def mark_random_init_params_from_checkpoint(
+    model: nn.Module,
+    checkpoint_path: str,
+    include_prefixes: Tuple[str, ...] | None = None,
+) -> str:
+    """Recover random-init parameter names without loading checkpoint weights."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    if all(key.startswith("module.") for key in state_dict):
+        state_dict = {key[7:]: value for key, value in state_dict.items()}
+
+    model_state = model.state_dict()
+    model_keys = list(model_state.keys())
+    if include_prefixes:
+        model_keys = [key for key in model_keys if matches_prefix(key, include_prefixes)]
+        if not model_keys:
+            raise RuntimeError(f"No model keys matched include_prefixes={include_prefixes}")
+
+    random_init_keys = set()
+    for key in model_keys:
+        if key not in state_dict:
+            random_init_keys.add(key)
+        elif state_dict[key].shape != model_state[key].shape:
+            random_init_keys.add(key)
+
+    model._random_init_param_names = {
+        name for name, _ in model.named_parameters() if name in random_init_keys
+    }
+    sample = sorted(model._random_init_param_names)[:20]
+    return f"random-init params={len(model._random_init_param_names)} sample={sample}"
+
+
 def set_trainable_state(
     model: nn.Module,
     epoch: int,
@@ -864,6 +896,25 @@ def build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.Optimizer:
     ]
     log("Optimizer groups: " + " | ".join(group_messages))
     return optimizer
+
+
+def optimizer_layout_matches_state(optimizer: torch.optim.Optimizer, state_dict: Dict) -> bool:
+    saved_groups = state_dict.get("param_groups", [])
+    if len(saved_groups) != len(optimizer.param_groups):
+        return False
+    return all(
+        len(saved_group.get("params", ())) == len(current_group.get("params", ()))
+        for saved_group, current_group in zip(saved_groups, optimizer.param_groups)
+    )
+
+
+def build_scheduler(optimizer: torch.optim.Optimizer, cfg: Config) -> torch.optim.lr_scheduler.CosineAnnealingLR:
+    sch_cfg = cfg.scheduler
+    return torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(int(sch_cfg.get("T_max", cfg.epochs)), 1),
+        eta_min=sch_cfg.eta_min,
+    )
 
 
 def save_checkpoint(path: Path, model, optimizer, scheduler, epoch, step, cfg, scaler=None) -> None:
@@ -948,7 +999,14 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
     # Build model via mmengine registry
     model = MODELS.build(cfg.model)
     checkpoint_include_prefixes = tuple(cfg.get("checkpoint_include_prefixes", ()))
-    if cfg.checkpoint:
+    if getattr(args, "resume", None) and cfg.get("resume_init_checkpoint", None):
+        msg = mark_random_init_params_from_checkpoint(
+            model,
+            cfg.resume_init_checkpoint,
+            include_prefixes=checkpoint_include_prefixes or None,
+        )
+        log(f"[resume] recovered optimizer grouping from init checkpoint: {msg}")
+    elif cfg.checkpoint:
         msg = load_model_from_checkpoint(
             model,
             cfg.checkpoint,
@@ -968,12 +1026,7 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
         )
 
     optimizer = build_optimizer(model, cfg)
-    sch_cfg = cfg.scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(int(sch_cfg.get("T_max", cfg.epochs)), 1),
-        eta_min=sch_cfg.eta_min,
-    )
+    scheduler = build_scheduler(optimizer, cfg)
 
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1022,14 +1075,20 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
         log(f"[resume] model weights restored from {resume_path}")
         # Optimizer
         if resume_ckpt.get("optimizer") is not None:
-            optimizer.load_state_dict(resume_ckpt["optimizer"])
-            log("[resume] optimizer state restored")
+            if optimizer_layout_matches_state(optimizer, resume_ckpt["optimizer"]):
+                optimizer.load_state_dict(resume_ckpt["optimizer"])
+                log("[resume] optimizer state restored")
+            else:
+                log(
+                    "[resume] optimizer group layout differs from the saved checkpoint; "
+                    "continuing with a freshly initialized optimizer."
+                )
         # Scheduler
-        if resume_ckpt.get("scheduler") is not None:
+        if resume_ckpt.get("scheduler") is not None and optimizer_layout_matches_state(optimizer, resume_ckpt["optimizer"]):
             scheduler.load_state_dict(resume_ckpt["scheduler"])
             log("[resume] scheduler state restored")
         # Scaler
-        if resume_ckpt.get("scaler") is not None:
+        if resume_ckpt.get("scaler") is not None and optimizer_layout_matches_state(optimizer, resume_ckpt["optimizer"]):
             scaler.load_state_dict(resume_ckpt["scaler"])
             log("[resume] grad scaler state restored")
         # Epoch / step counters
@@ -1293,6 +1352,7 @@ if __name__ == "__main__":
     # that the full training state (model + optimizer + scheduler) is restored
     # exclusively from the resume checkpoint inside train().
     if args.resume is not None:
+        cfg.resume_init_checkpoint = cfg.get("checkpoint", None)
         cfg.checkpoint = None
     if args.output_dir is not None:
         cfg.output_dir = args.output_dir
