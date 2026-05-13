@@ -337,8 +337,18 @@ class _MonoSceneUNet3DKitti(nn.Module):
         )
         self.up_13_l2 = _Upsample(self.feature * 4, self.feature * 2, norm_layer, bn_momentum)
         self.up_12_l1 = _Upsample(self.feature * 2, self.feature, norm_layer, bn_momentum)
-        self.up_l1_lfull = _Upsample(self.feature, self.feature // 2, norm_layer, bn_momentum)
-        self.ssc_head = _SegmentationHead(self.feature // 2, self.feature // 2, num_classes, dilations=(1, 2, 3))
+        if self.project_scale == 1:
+            self.up_l1_lfull = nn.Identity()
+            ssc_inplanes = self.feature
+        elif self.project_scale == 2:
+            self.up_l1_lfull = _Upsample(self.feature, self.feature // 2, norm_layer, bn_momentum)
+            ssc_inplanes = self.feature // 2
+        else:
+            raise ValueError(
+                "MonoSceneOccupancyHead currently supports project_scale=1 or 2, "
+                f"got {self.project_scale}"
+            )
+        self.ssc_head = _SegmentationHead(ssc_inplanes, ssc_inplanes, num_classes, dilations=(1, 2, 3))
         self.cp_mega_voxels = (
             _CPMegaVoxels(self.feature * 4, size_l3, n_relations=n_relations, bn_momentum=bn_momentum)
             if self.context_prior

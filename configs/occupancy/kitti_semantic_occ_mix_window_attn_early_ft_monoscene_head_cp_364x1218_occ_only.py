@@ -37,7 +37,7 @@ model = dict(
         point_cloud_range=occ_point_cloud_range,
         num_classes=20,
         feature=64,
-        project_scale=1,
+        project_scale=2,
         context_prior=True,
         n_relations=4,
     ),

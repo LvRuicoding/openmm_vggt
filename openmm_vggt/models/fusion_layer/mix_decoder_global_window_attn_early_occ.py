@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import torch
 from mmengine.registry import MODELS
@@ -31,6 +31,7 @@ class mix_decoder_global_window_attn_early_occ(mix_decoder_global_window_attn_ea
         use_top_k=True,
         top_k_per_patch=1,
         occupancy_head=None,
+        occupancy_view_indices: Sequence[int] | None = None,
         fusion_window_size: Tuple[int, int] = (10, 10),
         fusion_shift_size: Tuple[int, int] | None = None,
         fusion_window_stride: Tuple[int, int] | None = None,
@@ -60,6 +61,18 @@ class mix_decoder_global_window_attn_early_occ(mix_decoder_global_window_attn_ea
             fusion_mlp_ratio=fusion_mlp_ratio,
             fusion_attn_backend=fusion_attn_backend,
         )
+        self.occupancy_view_indices = None
+        if occupancy_view_indices is not None:
+            self.occupancy_view_indices = tuple(int(idx) for idx in occupancy_view_indices)
+            if not self.occupancy_view_indices:
+                raise ValueError("occupancy_view_indices must not be empty when provided")
+            invalid_indices = [
+                idx for idx in self.occupancy_view_indices if idx < 0 or idx >= self.cam_num
+            ]
+            if invalid_indices:
+                raise ValueError(
+                    f"occupancy_view_indices must be in [0, {self.cam_num}), got {invalid_indices}"
+                )
         self.occupancy_head = None
         if occupancy_head is not None:
             occupancy_head = dict(occupancy_head)
@@ -90,6 +103,26 @@ class mix_decoder_global_window_attn_early_occ(mix_decoder_global_window_attn_ea
             )
         start = (frame_count - 1) * self.cam_num
         return torch.arange(start, start + self.cam_num, device=device, dtype=torch.long)
+
+    def _occupancy_time_major_indices(
+        self,
+        sequence_length: int,
+        frame_count: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        last_frame_indices = self._last_frame_time_major_indices(
+            sequence_length=sequence_length,
+            frame_count=frame_count,
+            device=device,
+        )
+        if self.occupancy_view_indices is None:
+            return last_frame_indices
+        relative_view_indices = torch.tensor(
+            self.occupancy_view_indices,
+            device=device,
+            dtype=torch.long,
+        )
+        return last_frame_indices.index_select(0, relative_view_indices)
 
     def _forward_from_aggregator_outputs(
         self,
@@ -208,7 +241,7 @@ class mix_decoder_global_window_attn_early_occ(mix_decoder_global_window_attn_ea
                 predictions["depth_conf"] = self._camera_major_to_time_major(depth_conf, batch_size, frame_count)
 
             if self.occupancy_head is not None and others is not None:
-                view_indices = self._last_frame_time_major_indices(
+                view_indices = self._occupancy_time_major_indices(
                     sequence_length=sequence_length,
                     frame_count=frame_count,
                     device=others["intrinsics"].device,
@@ -221,7 +254,10 @@ class mix_decoder_global_window_attn_early_occ(mix_decoder_global_window_attn_ea
                 ]
                 occ_outputs = self.occupancy_head(
                     aggregated_tokens_list=occ_depth_tokens,
-                    images=images_time_major,
+                    images=images_time_major.index_select(
+                        1,
+                        view_indices.to(images_time_major.device),
+                    ),
                     intrinsics=others["intrinsics"].index_select(1, view_indices),
                     camera_to_world=others["camera_to_world"].index_select(1, view_indices),
                     lidar_to_world=last_frame_lidar_to_world,

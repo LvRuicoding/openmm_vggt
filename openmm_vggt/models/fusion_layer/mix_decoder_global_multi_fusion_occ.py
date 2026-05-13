@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Mapping, Tuple
+from typing import Mapping, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -35,6 +35,7 @@ class mix_decoder_global_multi_fusion_occ(mix_decoder_global_window_attn_early_o
         use_top_k=True,
         top_k_per_patch=1,
         occupancy_head=None,
+        occupancy_view_indices: Sequence[int] | None = None,
         fusion_layers: Tuple[int, ...] = (0, 12, 24),
         fusion_methods: Mapping[int | str, str] | None = None,
         fusion_share_weights: bool = False,
@@ -61,6 +62,7 @@ class mix_decoder_global_multi_fusion_occ(mix_decoder_global_window_attn_early_o
             use_top_k=use_top_k,
             top_k_per_patch=top_k_per_patch,
             occupancy_head=None,
+            occupancy_view_indices=occupancy_view_indices,
             fusion_window_size=fusion_window_size,
             fusion_shift_size=fusion_shift_size,
             fusion_window_stride=fusion_window_stride,
