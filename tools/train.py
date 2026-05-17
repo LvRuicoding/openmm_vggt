@@ -86,6 +86,19 @@ def reduce_scalar_dict(metrics_sum: Dict[str, float], count: int, device: torch.
     return {k: float(values[i].item() / total) for i, k in enumerate(keys)}
 
 
+def reduce_sum_dict(stats: Dict[str, float], device: torch.device) -> Dict[str, float]:
+    if not stats:
+        return {}
+    keys = sorted(stats.keys())
+    values = torch.tensor(
+        [stats[k] for k in keys],
+        device=device, dtype=torch.float64,
+    )
+    if is_dist_enabled():
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    return {k: float(values[i].item()) for i, k in enumerate(keys)}
+
+
 def unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
 
@@ -841,6 +854,16 @@ def set_trainable_state(
         else:
             frozen_count += param.numel()
 
+    # Put frozen BatchNorm/LayerNorm-with-stats modules into eval mode so their
+    # running statistics aren't updated while their parameters are detached.
+    bn_types = (nn.modules.batchnorm._BatchNorm, nn.SyncBatchNorm)
+    for module_name, module in model.named_modules():
+        if not isinstance(module, bn_types):
+            continue
+        bare_name = module_name[len("module."):] if module_name.startswith("module.") else module_name
+        if freeze_active and matches_prefix(bare_name, freeze_prefixes):
+            module.eval()
+
     stage = "depth_warmup" if freeze_active else "full_finetune"
     return f"{stage} trainable={trainable_count} frozen={frozen_count}"
 
@@ -1097,9 +1120,9 @@ def train(args: argparse.Namespace, cfg: Config) -> None:
         log(f"[resume] resuming from epoch {start_epoch}, global_step={global_step}")
 
     for epoch in range(start_epoch, cfg.epochs + 1):
+        model.train()
         stage_msg = set_trainable_state(model, epoch, freeze_prefixes, freeze_for_epochs)
         log(f"Epoch {epoch}: {stage_msg}")
-        model.train()
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 

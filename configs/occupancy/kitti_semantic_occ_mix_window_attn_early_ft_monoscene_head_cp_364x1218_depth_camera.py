@@ -3,7 +3,7 @@
 semantic_root = "/home/dataset-local/lr/code/openmm_vggt/data/kitti_semantic"
 raw_root = "/home/dataset-local/lr/code/openmm_vggt/data/kitti_raw"
 depth_root = "/home/dataset-local/lr/code/openmm_vggt/data/OpenDataLab___KITTI_depth_completion"
-dense_voxel_root = "/home/dataset-local/lr/code/openmm_vggt/data/odemetry_voxels"
+dense_voxel_root = "/home/dataset-local/lr/code/openmm_vggt/data/semantickitti"
 
 image_size = (364, 1218)
 n_time_steps = 3

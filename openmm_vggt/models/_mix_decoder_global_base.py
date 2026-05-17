@@ -162,11 +162,11 @@ class _MixDecoderGlobalBase(nn.Module, PyTorchModelHubMixin):
         )
 
         self.selected_list = [4, 11, 17, 23]
-        grid_size = [
-            int((point_cloud_range[3] - point_cloud_range[0]) / voxel_size[0]),
-            int((point_cloud_range[4] - point_cloud_range[1]) / voxel_size[1]),
-            int((point_cloud_range[5] - point_cloud_range[2]) / voxel_size[2]),
-        ]
+        fusion_voxel_size_tensor = torch.tensor(voxel_size, dtype=torch.float64)
+        fusion_pcr_tensor = torch.tensor(point_cloud_range, dtype=torch.float64)
+        grid_size = (
+            (fusion_pcr_tensor[3:] - fusion_pcr_tensor[:3]) / fusion_voxel_size_tensor
+        ).round().to(torch.long).tolist()
         self.voxel_encoder = PCDetDynamicVoxelVFE(
             num_point_features=4,
             voxel_size=voxel_size,

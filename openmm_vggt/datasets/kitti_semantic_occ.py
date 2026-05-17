@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -34,17 +36,9 @@ SEMANTIC_KITTI_RAW_MAPPING: Dict[str, str] = {
     "08": "2011_09_30/2011_09_30_drive_0028_sync",
     "09": "2011_09_30/2011_09_30_drive_0033_sync",
     "10": "2011_09_30/2011_09_30_drive_0034_sync",
-    "11": "2011_09_30/2011_09_30_drive_0012_sync",
-    "12": "2011_09_30/2011_09_30_drive_0013_sync",
-    "13": "2011_09_30/2011_09_30_drive_0014_sync",
-    "14": "2011_09_30/2011_09_30_drive_0015_sync",
-    "15": "2011_09_30/2011_09_30_drive_0016_sync",
-    "16": "2011_09_30/2011_09_30_drive_0018_sync",
-    "17": "2011_09_30/2011_09_30_drive_0019_sync",
-    "18": "2011_09_30/2011_09_30_drive_0027_sync",
-    "19": "2011_09_30/2011_09_30_drive_0028_sync",
-    "20": "2011_09_30/2011_09_30_drive_0033_sync",
-    "21": "2011_09_30/2011_09_30_drive_0034_sync",
+    # Sequences 11-21 (test split) only ship in the organized layout; their raw
+    # drive mapping is not provided here. Use the organized SemanticKITTI
+    # directory (image_2/image_3/calib.txt) for those.
 }
 
 DEFAULT_SPLITS: Dict[str, Tuple[str, ...]] = {
@@ -106,6 +100,24 @@ class _SequenceRecord:
     intrinsics_02: np.ndarray
     intrinsics_03: np.ndarray
     world_velodyne_poses: Dict[str, np.ndarray]
+    label_paths: Dict[str, Path]
+
+
+def _atomic_savez_compressed(path: Path, **arrays) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp.npz", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            np.savez_compressed(handle, **arrays)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
 
 
 def _raw_label_to_learning(raw_label: np.ndarray) -> np.ndarray:
@@ -129,6 +141,37 @@ def _load_semantic_poses(poses_path: Path) -> np.ndarray:
     if not poses:
         raise RuntimeError(f"No valid semantic poses found in {poses_path}")
     return np.stack(poses, axis=0)
+
+
+def _load_semantic_calib(calib_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    calib: Dict[str, np.ndarray] = {}
+    with calib_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            values = np.fromstring(value.strip(), sep=" ", dtype=np.float64)
+            if values.size == 12:
+                calib[key.strip()] = values.reshape(3, 4)
+
+    if "P2" not in calib or "P3" not in calib:
+        raise RuntimeError(f"Missing P2/P3 calibration in {calib_path}")
+
+    def projection_to_intrinsics_and_cam_from_ref(proj: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        intrinsics = proj[:3, :3].astype(np.float32)
+        cam_from_ref = np.eye(4, dtype=np.float64)
+        cam_from_ref[:3, 3] = np.linalg.solve(proj[:3, :3], proj[:3, 3])
+        return intrinsics, cam_from_ref
+
+    intrinsics_02, cam2_from_cam0 = projection_to_intrinsics_and_cam_from_ref(calib["P2"])
+    intrinsics_03, cam3_from_cam0 = projection_to_intrinsics_and_cam_from_ref(calib["P3"])
+    cam0_from_velo = np.eye(4, dtype=np.float64)
+    for key in ("Tr", "Tr_velo_to_cam", "Tr_velo_cam"):
+        if key in calib:
+            cam0_from_velo[:3, :] = calib[key]
+            break
+
+    return intrinsics_02, intrinsics_03, cam2_from_cam0, cam3_from_cam0, cam0_from_velo
 
 
 def _estimate_contiguous_offset(semantic_poses: np.ndarray, raw_positions: np.ndarray) -> int:
@@ -183,6 +226,12 @@ def _mark_free_voxels(
     target: np.ndarray,
     valid_mask: np.ndarray,
 ) -> None:
+    # Reference implementation: per-point ray casting in pure Python.
+    # Slow (O(>1s) per frame) and unused in the current pipeline because
+    # `_build_occupancy_target` always prefers the dense GT voxel labels under
+    # `gt_voxels/` when `dense_voxel_root` is configured. Kept only as a
+    # fallback / reference for future use; revisit and vectorize before relying
+    # on it in production.
     if points_xyz.size == 0:
         return
 
@@ -296,6 +345,11 @@ class KITTISemanticOccupancyDataset(Dataset):
         occupancy_cache_dir: Optional[str] = None,
         frustum_size: int = 0,
         color_jitter: Optional[Tuple[float, float, float]] = None,
+        load_lidar: bool = True,
+        random_lidar_subsample: bool = True,
+        shuffle_max_samples: bool = True,
+        max_samples_seed: int = 0,
+        return_metadata: bool = True,
     ) -> None:
         assert n_time_steps >= 1
         assert image_size[0] % 14 == 0 and image_size[1] % 14 == 0
@@ -311,7 +365,13 @@ class KITTISemanticOccupancyDataset(Dataset):
         self.max_sequences = max_sequences
         self.max_samples = max_samples
         self.max_lidar_points = max_lidar_points
-        self.seq_len = self.n_time_steps * 2
+        self.cam_num = 2
+        self.seq_len = self.n_time_steps * self.cam_num
+        self.load_lidar = bool(load_lidar)
+        self.random_lidar_subsample = bool(random_lidar_subsample)
+        self.shuffle_max_samples = bool(shuffle_max_samples)
+        self.max_samples_seed = int(max_samples_seed)
+        self.return_metadata = bool(return_metadata)
 
         self.voxel_size = np.asarray(voxel_size, dtype=np.float32)
         self.point_cloud_range = np.asarray(point_cloud_range, dtype=np.float32)
@@ -319,6 +379,8 @@ class KITTISemanticOccupancyDataset(Dataset):
         self.num_classes = 20
         self.ignore_index = 255
         self.dense_voxel_root = Path(dense_voxel_root) if dense_voxel_root is not None else None
+        if self.dense_voxel_root is None and (self.semantic_root / "sequences").is_dir():
+            self.dense_voxel_root = self.semantic_root
         self.require_dense_voxel_target = bool(require_dense_voxel_target)
         self.frustum_size = int(frustum_size)
         if self.frustum_size < 0:
@@ -344,8 +406,91 @@ class KITTISemanticOccupancyDataset(Dataset):
     def _load_sequences(self) -> List[_SequenceRecord]:
         records: List[_SequenceRecord] = []
         for sequence_id in self.sequences:
-            semantic_seq_root = self.semantic_root / sequence_id
-            raw_drive_rel = SEMANTIC_KITTI_RAW_MAPPING[sequence_id]
+            semantic_seq_root = self.semantic_root / "sequences" / sequence_id
+            if not semantic_seq_root.is_dir():
+                semantic_seq_root = self.semantic_root / sequence_id
+
+            organized_layout = (
+                (semantic_seq_root / "image_2").is_dir()
+                and (semantic_seq_root / "image_3").is_dir()
+                and (semantic_seq_root / "calib.txt").is_file()
+            )
+            if organized_layout:
+                image_paths_02 = {path.stem: path for path in sorted((semantic_seq_root / "image_2").glob("*.png"))}
+                image_paths_03 = {path.stem: path for path in sorted((semantic_seq_root / "image_3").glob("*.png"))}
+                semantic_velodyne = {path.stem: path for path in sorted((semantic_seq_root / "velodyne").glob("*.bin"))}
+                label_root = semantic_seq_root / "labels"
+                if not label_root.is_dir():
+                    label_root = semantic_seq_root / "voxels"
+                semantic_labels = {path.stem: path for path in sorted(label_root.glob("*.label"))}
+
+                semantic_frame_ids = sorted(set(semantic_velodyne) & set(image_paths_02) & set(image_paths_03))
+                if sequence_id not in DEFAULT_SPLITS["test"]:
+                    semantic_frame_ids = [frame_id for frame_id in semantic_frame_ids if frame_id in semantic_labels]
+                pose_path = semantic_seq_root / "poses.txt"
+                if not pose_path.is_file():
+                    pose_path = self.semantic_root / "poses" / f"{sequence_id}.txt"
+                if not semantic_frame_ids or not pose_path.is_file():
+                    if self.strict:
+                        raise FileNotFoundError(f"Missing organized SemanticKITTI sequence data under {semantic_seq_root}")
+                    continue
+
+                semantic_poses = _load_semantic_poses(pose_path)
+                semantic_pose_count = min(semantic_poses.shape[0], len(semantic_frame_ids))
+                semantic_frame_ids = semantic_frame_ids[:semantic_pose_count]
+                semantic_poses = semantic_poses[:semantic_pose_count]
+                intrinsics_02, intrinsics_03, t_cam2_cam0, t_cam3_cam0, t_cam0_velo = _load_semantic_calib(
+                    semantic_seq_root / "calib.txt"
+                )
+
+                extrinsics_02: Dict[str, np.ndarray] = {}
+                extrinsics_03: Dict[str, np.ndarray] = {}
+                world_velodyne_poses: Dict[str, np.ndarray] = {}
+                image_paths_02_sem: Dict[str, Path] = {}
+                image_paths_03_sem: Dict[str, Path] = {}
+                label_paths_sem: Dict[str, Path] = {}
+                for pose, semantic_frame_id in zip(semantic_poses, semantic_frame_ids):
+                    t_world_cam0 = pose.astype(np.float64)
+                    t_cam0_world = np.linalg.inv(t_world_cam0)
+                    extrinsics_02[semantic_frame_id] = (t_cam2_cam0 @ t_cam0_world)[:3, :4].astype(np.float32)
+                    extrinsics_03[semantic_frame_id] = (t_cam3_cam0 @ t_cam0_world)[:3, :4].astype(np.float32)
+                    world_velodyne_poses[semantic_frame_id] = (t_world_cam0 @ t_cam0_velo).astype(np.float32)
+                    image_paths_02_sem[semantic_frame_id] = image_paths_02[semantic_frame_id]
+                    image_paths_03_sem[semantic_frame_id] = image_paths_03[semantic_frame_id]
+                    if semantic_frame_id in semantic_labels:
+                        label_paths_sem[semantic_frame_id] = semantic_labels[semantic_frame_id]
+
+                first_path = image_paths_02_sem[semantic_frame_ids[0]]
+                raw_w, raw_h = Image.open(first_path).size
+
+                records.append(
+                    _SequenceRecord(
+                        sequence_id=sequence_id,
+                        raw_drive_name=sequence_id,
+                        raw_root=semantic_seq_root,
+                        semantic_root=semantic_seq_root,
+                        raw_hw=(raw_h, raw_w),
+                        frame_ids=semantic_frame_ids,
+                        image_paths_02=image_paths_02_sem,
+                        image_paths_03=image_paths_03_sem,
+                        extrinsics_02=extrinsics_02,
+                        extrinsics_03=extrinsics_03,
+                        intrinsics_02=intrinsics_02,
+                        intrinsics_03=intrinsics_03,
+                        world_velodyne_poses=world_velodyne_poses,
+                        label_paths=label_paths_sem,
+                    )
+                )
+                continue
+
+            raw_drive_rel = SEMANTIC_KITTI_RAW_MAPPING.get(sequence_id)
+            if raw_drive_rel is None:
+                if self.strict:
+                    raise FileNotFoundError(
+                        f"Sequence {sequence_id} has no raw-drive mapping; an organized layout "
+                        f"under sequences/{sequence_id} is required."
+                    )
+                continue
             raw_drive_root = self.raw_root / raw_drive_rel
             calib_root = raw_drive_root.parent
             if not semantic_seq_root.is_dir() or not raw_drive_root.is_dir():
@@ -392,6 +537,7 @@ class KITTISemanticOccupancyDataset(Dataset):
             world_velodyne_poses: Dict[str, np.ndarray] = {}
             image_paths_02_sem: Dict[str, Path] = {}
             image_paths_03_sem: Dict[str, Path] = {}
+            label_paths_sem: Dict[str, Path] = {}
             for semantic_frame_id, raw_frame_id in zip(semantic_frame_ids, mapped_raw_ids):
                 t_world_imu = oxts_poses[raw_frame_id]
                 t_imu_world = np.linalg.inv(t_world_imu)
@@ -400,6 +546,8 @@ class KITTISemanticOccupancyDataset(Dataset):
                 world_velodyne_poses[semantic_frame_id] = (t_world_imu @ t_imu_velo).astype(np.float32)
                 image_paths_02_sem[semantic_frame_id] = image_paths_02[raw_frame_id]
                 image_paths_03_sem[semantic_frame_id] = image_paths_03[raw_frame_id]
+                if semantic_frame_id in semantic_labels:
+                    label_paths_sem[semantic_frame_id] = semantic_labels[semantic_frame_id]
 
             first_path = image_paths_02_sem[semantic_frame_ids[0]]
             raw_w, raw_h = Image.open(first_path).size
@@ -419,6 +567,7 @@ class KITTISemanticOccupancyDataset(Dataset):
                     intrinsics_02=intrinsics_02,
                     intrinsics_03=intrinsics_03,
                     world_velodyne_poses=world_velodyne_poses,
+                    label_paths=label_paths_sem,
                 )
             )
 
@@ -429,25 +578,31 @@ class KITTISemanticOccupancyDataset(Dataset):
 
     def _build_samples(self) -> List[Tuple[int, int]]:
         samples: List[Tuple[int, int]] = []
+        min_last_idx = (self.n_time_steps - 1) * self.stride
         for record_idx, record in enumerate(self.records):
             for last_idx in range(len(record.frame_ids)):
+                if last_idx < min_last_idx:
+                    continue
                 if self.require_dense_voxel_target:
-                    min_last_idx = (self.n_time_steps - 1) * self.stride
-                    if last_idx < min_last_idx:
-                        continue
                     last_frame_id = record.frame_ids[last_idx]
                     dense_label_path = (
                         self.dense_voxel_root
                         / "sequences"
                         / record.sequence_id
-                        / "voxels"
+                        / "gt_voxels"
                         / f"{last_frame_id}.label"
                     )
                     if not dense_label_path.is_file():
                         continue
                 samples.append((record_idx, last_idx))
-        if self.max_samples is not None:
-            samples = samples[: self.max_samples]
+        if self.max_samples is not None and len(samples) > self.max_samples:
+            if self.shuffle_max_samples:
+                rng = np.random.default_rng(self.max_samples_seed)
+                indices = rng.permutation(len(samples))[: self.max_samples]
+                indices.sort()
+                samples = [samples[i] for i in indices]
+            else:
+                samples = samples[: self.max_samples]
         return samples
 
     def __len__(self) -> int:
@@ -460,7 +615,10 @@ class KITTISemanticOccupancyDataset(Dataset):
         world_points = np.concatenate([world_xyz, points[:, 3:4]], axis=1)
 
         if world_points.shape[0] > self.max_lidar_points:
-            indices = np.linspace(0, world_points.shape[0] - 1, self.max_lidar_points, dtype=np.int64)
+            if self.random_lidar_subsample:
+                indices = np.random.choice(world_points.shape[0], self.max_lidar_points, replace=False)
+            else:
+                indices = np.linspace(0, world_points.shape[0] - 1, self.max_lidar_points, dtype=np.int64)
             world_points = world_points[indices]
 
         point_tensor = torch.zeros((self.max_lidar_points, 4), dtype=torch.float32)
@@ -481,7 +639,7 @@ class KITTISemanticOccupancyDataset(Dataset):
         image_tag = f"{self.image_size[0]}_{self.image_size[1]}"
         source_tag = "dense_v1" if self.dense_voxel_root is not None else "ssc_free_v1"
         return self.occupancy_cache_dir / (
-            f"{sequence_id}_{frame_id}_{grid_tag}_{image_tag}_{source_tag}_frustum_{self.frustum_size}.npz"
+            f"{sequence_id}_{frame_id}_{grid_tag}_{image_tag}_{source_tag}_frustum_{self.frustum_size}_sparse.npz"
         )
 
     @staticmethod
@@ -496,7 +654,7 @@ class KITTISemanticOccupancyDataset(Dataset):
         if self.dense_voxel_root is None:
             return None
 
-        voxel_dir = self.dense_voxel_root / "sequences" / sequence_id / "voxels"
+        voxel_dir = self.dense_voxel_root / "sequences" / sequence_id / "gt_voxels"
         label_path = voxel_dir / f"{frame_id}.label"
         invalid_path = voxel_dir / f"{frame_id}.invalid"
         if not label_path.is_file():
@@ -510,7 +668,7 @@ class KITTISemanticOccupancyDataset(Dataset):
         elif source_size == 256 * 256 * 32:
             source_grid_size = np.asarray((256, 256, 32), dtype=np.int32)
         else:
-            raise RuntimeError(f"Unexpected dense voxel label size for {label_path}: {source_size}")
+            return None
 
         target = _raw_label_to_learning(raw_label.astype(np.uint32)).astype(np.int64)
         valid_mask = np.ones(source_size, dtype=bool)
@@ -540,11 +698,24 @@ class KITTISemanticOccupancyDataset(Dataset):
         dense_target = self._load_dense_voxel_target(record.sequence_id, frame_id)
         if dense_target is not None:
             target, valid_mask = dense_target
-            np.savez_compressed(cache_path, target=target.numpy().astype(np.int64), valid_mask=valid_mask.numpy().astype(bool))
+            _atomic_savez_compressed(
+                cache_path,
+                target=target.numpy().astype(np.int64),
+                valid_mask=valid_mask.numpy().astype(bool),
+            )
             return target, valid_mask
 
         points = np.fromfile(record.semantic_root / "velodyne" / f"{frame_id}.bin", dtype=np.float32).reshape(-1, 4)
-        labels = np.fromfile(record.semantic_root / "labels" / f"{frame_id}.label", dtype=np.uint32)
+        if frame_id not in record.label_paths:
+            raise FileNotFoundError(f"No semantic label found for sequence={record.sequence_id}, frame={frame_id}")
+        labels = np.fromfile(record.label_paths[frame_id], dtype=np.uint32)
+        if labels.shape[0] != points.shape[0]:
+            labels = np.fromfile(record.label_paths[frame_id], dtype=np.uint16).astype(np.uint32)
+        if labels.shape[0] != points.shape[0]:
+            raise RuntimeError(
+                f"Point/label count mismatch for {record.label_paths[frame_id]}: "
+                f"{points.shape[0]} points vs {labels.shape[0]} labels"
+            )
         learning_labels = _raw_label_to_learning(labels)
 
         coords = np.floor((points[:, :3] - self.point_cloud_range[:3]) / self.voxel_size).astype(np.int32)
@@ -588,7 +759,7 @@ class KITTISemanticOccupancyDataset(Dataset):
         target = target.reshape(*self.grid_size)
         valid_mask = valid_mask.reshape(*self.grid_size)
 
-        np.savez_compressed(cache_path, target=target, valid_mask=valid_mask)
+        _atomic_savez_compressed(cache_path, target=target, valid_mask=valid_mask)
         return torch.from_numpy(target.astype(np.int64)), torch.from_numpy(valid_mask.astype(bool))
 
     def _voxel_centers_lidar(self) -> np.ndarray:
@@ -629,13 +800,25 @@ class KITTISemanticOccupancyDataset(Dataset):
         occupancy_target: torch.Tensor,
         occupancy_valid_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_frustums = self.frustum_size * self.frustum_size
+        grid_volume = int(np.prod(self.grid_size))
+        grid_shape = (*self.grid_size.tolist(),)
         cache_path = self._frustum_cache_path(record.sequence_id, frame_id)
         if cache_path.is_file():
             cached = np.load(cache_path)
-            return (
-                torch.from_numpy(cached["frustums_masks"].astype(bool)),
-                torch.from_numpy(cached["frustums_class_dists"].astype(np.float32)),
-            )
+            mask_indices = cached["mask_indices"]
+            mask_offsets = cached["mask_offsets"]
+            class_dists = cached["frustums_class_dists"].astype(np.float32)
+            frustum_masks = np.zeros((self.cam_num * num_frustums * grid_volume,), dtype=bool)
+            for slot in range(self.cam_num * num_frustums):
+                start = int(mask_offsets[slot])
+                end = int(mask_offsets[slot + 1])
+                if start == end:
+                    continue
+                slot_indices = mask_indices[start:end].astype(np.int64) + slot * grid_volume
+                frustum_masks[slot_indices] = True
+            frustum_masks = frustum_masks.reshape(self.cam_num, num_frustums, *grid_shape)
+            return torch.from_numpy(frustum_masks), torch.from_numpy(class_dists)
 
         target = occupancy_target.numpy()
         valid_target = occupancy_valid_mask.numpy().astype(bool) & (target != self.ignore_index)
@@ -643,16 +826,16 @@ class KITTISemanticOccupancyDataset(Dataset):
         flat_valid_target = valid_target.reshape(-1)
         centers_lidar = self._voxel_centers_lidar()
         image_h, image_w = self.image_size
-        num_frustums = self.frustum_size * self.frustum_size
 
-        frustum_masks = np.zeros((2, num_frustums, *self.grid_size.tolist()), dtype=bool)
-        frustum_class_dists = np.zeros((2, num_frustums, self.num_classes), dtype=np.float32)
+        frustum_masks = np.zeros((self.cam_num, num_frustums, *grid_shape), dtype=bool)
+        frustum_class_dists = np.zeros((self.cam_num, num_frustums, self.num_classes), dtype=np.float32)
         lidar_to_world = record.world_velodyne_poses[frame_id]
         camera_specs = (
             (record.intrinsics_02, record.extrinsics_02[frame_id]),
             (record.intrinsics_03, record.extrinsics_03[frame_id]),
         )
 
+        per_slot_indices: List[np.ndarray] = []
         for cam_idx, (intrinsics_raw, extrinsics) in enumerate(camera_specs):
             intrinsics = resize_intrinsics(intrinsics_raw, orig_hw=record.raw_hw, out_hw=self.image_size)
             pix_x, pix_y, pix_z = self._project_lidar_centers_to_image(
@@ -677,15 +860,28 @@ class KITTISemanticOccupancyDataset(Dataset):
                     x0 = x_idx * image_w / self.frustum_size
                     x1 = (x_idx + 1) * image_w / self.frustum_size
                     mask_flat = in_image & (pix_x >= x0) & (pix_x < x1) & (pix_y >= y0) & (pix_y < y1)
-                    frustum_masks[cam_idx, frustum_idx] = mask_flat.reshape(*self.grid_size.tolist())
-                    if mask_flat.any():
-                        counts = np.bincount(flat_target[mask_flat].astype(np.int64), minlength=self.num_classes)
+                    slot_indices = np.flatnonzero(mask_flat).astype(np.int32)
+                    per_slot_indices.append(slot_indices)
+                    if slot_indices.size > 0:
+                        frustum_masks[cam_idx, frustum_idx].reshape(-1)[slot_indices] = True
+                        counts = np.bincount(
+                            flat_target[slot_indices.astype(np.int64)].astype(np.int64),
+                            minlength=self.num_classes,
+                        )
                         frustum_class_dists[cam_idx, frustum_idx] = counts[: self.num_classes].astype(np.float32)
                     frustum_idx += 1
 
-        np.savez_compressed(
+        sizes = np.fromiter((slot.size for slot in per_slot_indices), dtype=np.int64, count=len(per_slot_indices))
+        mask_offsets = np.concatenate(([0], np.cumsum(sizes))).astype(np.int64)
+        if per_slot_indices and sizes.sum() > 0:
+            mask_indices = np.concatenate(per_slot_indices).astype(np.int32)
+        else:
+            mask_indices = np.empty((0,), dtype=np.int32)
+
+        _atomic_savez_compressed(
             cache_path,
-            frustums_masks=frustum_masks,
+            mask_indices=mask_indices,
+            mask_offsets=mask_offsets,
             frustums_class_dists=frustum_class_dists,
         )
         return torch.from_numpy(frustum_masks), torch.from_numpy(frustum_class_dists)
@@ -724,8 +920,12 @@ class KITTISemanticOccupancyDataset(Dataset):
             last_idx - (self.n_time_steps - 1 - t) * self.stride
             for t in range(self.n_time_steps)
         ]
-        clamped_indices = [max(0, idx) for idx in raw_indices]
-        time_frame_ids = [record.frame_ids[idx] for idx in clamped_indices]
+        if raw_indices[0] < 0:
+            raise IndexError(
+                f"Sample {index} for sequence {record.sequence_id} has insufficient history "
+                f"(last_idx={last_idx}, n_time_steps={self.n_time_steps}, stride={self.stride})."
+            )
+        time_frame_ids = [record.frame_ids[idx] for idx in raw_indices]
 
         images_list: List[torch.Tensor] = []
         extrinsics_list: List[torch.Tensor] = []
@@ -759,10 +959,11 @@ class KITTISemanticOccupancyDataset(Dataset):
                 camera_to_world_list.append(torch.from_numpy(np.linalg.inv(extrinsics_h).astype(np.float32)))
                 intrinsics_list.append(torch.from_numpy(resize_intrinsics(intrinsics_raw, orig_hw=orig_hw, out_hw=self.image_size)))
 
-            lidar_points, lidar_mask = self._load_world_lidar_points(record, frame_id)
-            lidar_points_list.append(lidar_points)
-            lidar_mask_list.append(lidar_mask)
-            lidar_to_world_list.append(torch.from_numpy(record.world_velodyne_poses[frame_id].astype(np.float32)))
+            if self.load_lidar:
+                lidar_points, lidar_mask = self._load_world_lidar_points(record, frame_id)
+                lidar_points_list.append(lidar_points)
+                lidar_mask_list.append(lidar_mask)
+                lidar_to_world_list.append(torch.from_numpy(record.world_velodyne_poses[frame_id].astype(np.float32)))
 
         target_frame_id = time_frame_ids[-1]
         occupancy_target, occupancy_valid_mask = self._build_occupancy_target(record, target_frame_id)
@@ -772,12 +973,13 @@ class KITTISemanticOccupancyDataset(Dataset):
             "extrinsics": torch.stack(extrinsics_list, dim=0),
             "intrinsics": torch.stack(intrinsics_list, dim=0),
             "camera_to_world": torch.stack(camera_to_world_list, dim=0),
-            "lidar_to_world": torch.stack(lidar_to_world_list, dim=0),
-            "points": torch.stack(lidar_points_list, dim=0),
-            "point_mask": torch.stack(lidar_mask_list, dim=0),
             "occupancy_target": occupancy_target,
             "occupancy_valid_mask": occupancy_valid_mask,
         }
+        if self.load_lidar:
+            sample["lidar_to_world"] = torch.stack(lidar_to_world_list, dim=0)
+            sample["points"] = torch.stack(lidar_points_list, dim=0)
+            sample["point_mask"] = torch.stack(lidar_mask_list, dim=0)
         if self.frustum_size > 0:
             frustums_masks, frustums_class_dists = self._build_frustum_targets(
                 record,
@@ -787,4 +989,12 @@ class KITTISemanticOccupancyDataset(Dataset):
             )
             sample["frustums_masks"] = frustums_masks
             sample["frustums_class_dists"] = frustums_class_dists
+        if self.return_metadata:
+            sample["meta"] = {
+                "sequence_id": record.sequence_id,
+                "frame_id": target_frame_id,
+                "time_frame_ids": list(time_frame_ids),
+                "n_time_steps": self.n_time_steps,
+                "cam_num": self.cam_num,
+            }
         return sample
